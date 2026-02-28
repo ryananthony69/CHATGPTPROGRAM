@@ -1,0 +1,14 @@
+﻿logs/
+**/tmp/
+settings.json
+
+# Don't commit large/installed WebView2 bits
+deps/WebView2/lib/*.dll
+deps/WebView2/lib/*.pdb
+deps/WebView2/fixed/
+deps/**/_pkg/
+*.nupkg
+
+Thumbs.db
+desktop.ini
+.DS_Store
