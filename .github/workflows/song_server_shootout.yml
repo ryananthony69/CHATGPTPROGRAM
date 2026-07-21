@@ -1,0 +1,348 @@
+name: Song Server Shootout
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/song_server_shootout.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish run identifier
+        run: |
+          mkdir -p .songlab
+          printf '%s' "$GITHUB_RUN_ID" > .songlab/run-id2.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .songlab/run-id2.txt
+          git commit -m "Record song server render run" || true
+          git push
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq
+          python -m pip install -q --upgrade pip
+          python -m pip install -q requests faster-whisper jiwer
+
+      - name: Generate, validate, and rank candidates
+        env:
+          HOST: https://www.serveurperso.com/ia/music
+        run: |
+          cat > run.py <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import time
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from jiwer import wer
+
+          HOST = os.environ["HOST"].rstrip("/")
+          OUT = Path("final")
+          RAW = Path("raw")
+          OUT.mkdir(exist_ok=True)
+          RAW.mkdir(exist_ok=True)
+          session = requests.Session()
+          session.headers.update({"User-Agent": "song-quality-shootout/1.0"})
+
+          LYRICS = """[Intro]
+          Turn it on.
+          No, seriously.
+
+          [Verse]
+          Hoodie on the chair,
+          Why you standing there?
+          I know you're just a sleeve,
+          But tonight I don't believe.
+          Cat is staring past my head,
+          Then he slowly leaves the bed.
+          If he sees what I can't see,
+          That feels personal to me.
+
+          [Prechorus]
+          I can pay the rent on time.
+          I can change a tire just fine.
+          But the hallway after two?
+          Absolutely not. No thank you.
+
+          [Chorus]
+          Turn on the light, turn on the light.
+          Everything gets taller in the middle of the night.
+          Turn on the light, turn on the light.
+          I'm brave enough tomorrow, but I'm busy tonight.
+
+          [Verse]
+          Phone at one percent,
+          Charger by the vent.
+          Six feet from the bed,
+          Might as well be miles ahead.
+          Roomba starts at three,
+          Something's chasing me.
+          If a ghost lives here rent-free,
+          It can split the gas with me.
+
+          [Bridge]
+          Basement pull-chain,
+          That design is insane.
+          Kill the light and run upstairs,
+          While pretending no one cares.
+          Ghost, if you're staying here,
+          Rent is due this year.
+          You can haunt the kitchen free,
+          But you're splitting gas with me.
+
+          [Final Chorus]
+          Turn on the light, turn on the light.
+          Everything gets taller in the middle of the night.
+          Turn on the light, turn on the light.
+          I'm brave enough tomorrow, but I'm busy tonight.
+
+          [Outro]
+          It was the cat.
+          """
+
+          PROMPT = (
+              "catchy upbeat 2000s power-pop and pop-rock song, natural expressive adult male lead singer, "
+              "slightly nervous intimate verses, huge melodic singalong chorus, bright crunchy electric guitars, "
+              "live punchy drums, melodic bass, subtle spooky organ, tight backing harmonies, polished modern radio mix, "
+              "dry humorous lyrics delivered completely sincerely, clear intelligible English vocals, immediate guitar hook, "
+              "strong verse-prechorus-chorus dynamics"
+          )
+          NEGATIVE = (
+              "spoken word, narration, rap, robotic voice, text to speech, vocoder, monotone vocal, chipmunk voice, "
+              "metal growl, horror scream, children singing, muddy mix, muffled vocal, long instrumental intro"
+          )
+
+          (OUT / "Lyrics.txt").write_text(LYRICS, encoding="utf-8")
+          (OUT / "Prompt.txt").write_text(PROMPT, encoding="utf-8")
+
+          def get_json(path):
+              r = session.get(HOST + path, timeout=30)
+              r.raise_for_status()
+              return r.json()
+
+          def all_strings(obj):
+              if isinstance(obj, str):
+                  yield obj
+              elif isinstance(obj, dict):
+                  for k, v in obj.items():
+                      yield str(k)
+                      yield from all_strings(v)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      yield from all_strings(v)
+
+          health = get_json("/health")
+          props = get_json("/props")
+          (RAW / "health.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+          (RAW / "props.json").write_text(json.dumps(props, indent=2), encoding="utf-8")
+          strings = list(dict.fromkeys(all_strings(props)))
+
+          lm_names = [s for s in strings if "5Hz-lm" in s and (s.endswith(".gguf") or "acestep-5Hz" in s)]
+          dit_names = [s for s in strings if "acestep-v15" in s and (s.endswith(".gguf") or "v15-" in s)]
+          vae_names = [s for s in strings if "vae" in s.lower() and s.endswith(".gguf")]
+
+          def pick(items, preferences):
+              for pref in preferences:
+                  for item in items:
+                      if all(token.lower() in item.lower() for token in pref):
+                          return item
+              return items[0] if items else None
+
+          lm = pick(lm_names, [
+              ("4B", "Q8"), ("4B", "Q6"), ("4B", "Q5"), ("4B", "Q4"),
+              ("1.7B", "Q8"), ("1.7B",), ("0.6B",)
+          ])
+          dit = pick(dit_names, [
+              ("sft", "Q8"), ("sft", "Q6"), ("sft", "Q5"), ("sft", "Q4"),
+              ("turbo-shift3", "Q8"), ("turbo-shift3",),
+              ("turbo", "Q8"), ("turbo", "Q6"), ("turbo", "Q5"), ("turbo", "Q4")
+          ])
+          vae = pick(vae_names, [("BF16",), ("vae",)])
+
+          cli = props.get("cli", {}) if isinstance(props, dict) else {}
+          max_batch = int(cli.get("max_batch", 2) or 2)
+          batch = max(1, min(4, max_batch))
+          is_sft = bool(dit and "sft" in dit.lower())
+          selection = {"lm": lm, "dit": dit, "vae": vae, "max_batch": max_batch, "batch": batch, "is_sft": is_sft}
+          (RAW / "selection.json").write_text(json.dumps(selection, indent=2), encoding="utf-8")
+          print("SELECTION", json.dumps(selection))
+
+          request = {
+              "name": "Turn On the Light",
+              "caption": PROMPT,
+              "lyrics": LYRICS,
+              "bpm": 138,
+              "duration": 68,
+              "keyscale": "D major",
+              "timesignature": "4",
+              "vocal_language": "en",
+              "lm_temperature": 0.72,
+              "lm_cfg_scale": 2.4,
+              "lm_top_p": 0.9,
+              "lm_top_k": 0,
+              "lm_negative_prompt": NEGATIVE,
+              "lm_batch_size": batch,
+              "inference_steps": 50 if is_sft else 8,
+              "guidance_scale": 1.0 if is_sft else 1.0,
+              "shift": 1.0 if is_sft else 3.0,
+              "output_format": "mp3",
+              "mp3_bitrate": 256,
+          }
+          if lm: request["lm_model"] = lm
+          if dit: request["synth_model"] = dit
+          if vae: request["vae_model"] = vae
+          (RAW / "request.json").write_text(json.dumps(request, indent=2), encoding="utf-8")
+
+          def submit(endpoint, payload):
+              for attempt in range(8):
+                  r = session.post(HOST + endpoint, json=payload, timeout=60)
+                  if r.status_code == 503:
+                      time.sleep(int(r.headers.get("Retry-After", "5")))
+                      continue
+                  r.raise_for_status()
+                  data = r.json()
+                  jid = data.get("id") or data.get("job_id")
+                  if not jid:
+                      raise RuntimeError(f"No job id from {endpoint}: {data}")
+                  return jid
+              raise RuntimeError(f"Server stayed busy for {endpoint}")
+
+          def wait_job(jid, limit=600):
+              for _ in range(limit):
+                  r = session.get(HOST + "/job", params={"id": jid}, timeout=30)
+                  r.raise_for_status()
+                  data = r.json()
+                  status = data.get("status")
+                  if status == "done":
+                      rr = session.get(HOST + "/job", params={"id": jid, "result": 1}, timeout=120)
+                      rr.raise_for_status()
+                      return rr
+                  if status in {"failed", "cancelled"}:
+                      raise RuntimeError(f"Job {jid} failed: {data}")
+                  time.sleep(3)
+              raise TimeoutError(f"Job {jid} timed out")
+
+          lm_id = submit("/lm", request)
+          lm_response = wait_job(lm_id)
+          try:
+              candidates = lm_response.json()
+          except Exception:
+              raise RuntimeError(f"LM result was not JSON: {lm_response.text[:500]}")
+          if isinstance(candidates, dict):
+              candidates = candidates.get("results") or candidates.get("data") or [candidates]
+          if not isinstance(candidates, list):
+              candidates = [candidates]
+          (RAW / "lm_results.json").write_text(json.dumps(candidates, indent=2), encoding="utf-8")
+          print("LM candidates", len(candidates))
+
+          audio_files = []
+          for i, candidate in enumerate(candidates[:batch]):
+              if isinstance(candidate, str):
+                  candidate = json.loads(candidate)
+              candidate.update({
+                  "name": f"Turn On the Light candidate {i+1}",
+                  "synth_model": dit or candidate.get("synth_model"),
+                  "vae_model": vae or candidate.get("vae_model"),
+                  "inference_steps": 50 if is_sft else 8,
+                  "guidance_scale": 1.0,
+                  "shift": 1.0 if is_sft else 3.0,
+                  "output_format": "mp3",
+                  "mp3_bitrate": 256,
+                  "lm_negative_prompt": NEGATIVE,
+              })
+              (RAW / f"candidate_{i+1}.json").write_text(json.dumps(candidate, indent=2), encoding="utf-8")
+              sid = submit("/synth", candidate)
+              audio_response = wait_job(sid)
+              ctype = audio_response.headers.get("content-type", "")
+              path = RAW / f"candidate_{i+1}.mp3"
+              path.write_bytes(audio_response.content)
+              if path.stat().st_size < 10000:
+                  raise RuntimeError(f"Candidate {i+1} too small ({path.stat().st_size}), type={ctype}, body={audio_response.text[:500]}")
+              audio_files.append(path)
+
+          if not audio_files:
+              raise RuntimeError("No audio files generated")
+
+          # Transcribe and rank by lyric adherence plus basic audio integrity.
+          from faster_whisper import WhisperModel
+          whisper = WhisperModel("small.en", device="cpu", compute_type="int8")
+
+          def norm(s):
+              s = re.sub(r"\[[^]]+\]", " ", s.lower())
+              s = re.sub(r"[^a-z0-9' ]+", " ", s)
+              return " ".join(s.split())
+
+          expected = norm(LYRICS)
+          rows = []
+          for p in audio_files:
+              master = OUT / (p.stem + "_mastered.mp3")
+              subprocess.run([
+                  "ffmpeg", "-y", "-loglevel", "error", "-i", str(p),
+                  "-af", "highpass=f=35,loudnorm=I=-14:TP=-1.0:LRA=10",
+                  "-codec:a", "libmp3lame", "-b:a", "256k", str(master)
+              ], check=True)
+              probe = json.loads(subprocess.check_output([
+                  "ffprobe", "-v", "error", "-show_entries", "format=duration,size",
+                  "-of", "json", str(master)
+              ], text=True))["format"]
+              duration = float(probe.get("duration", 0))
+              segments, info = whisper.transcribe(str(master), beam_size=5, vad_filter=True, language="en")
+              transcript = " ".join(seg.text.strip() for seg in segments).strip()
+              clean = norm(transcript)
+              lyric_wer = wer(expected, clean) if clean else 2.0
+              hook = clean.count("turn on the light")
+              keywords = sum(1 for k in ["hoodie", "chair", "cat", "roomba", "ghost", "light", "rent"] if k in clean)
+              dur_score = 12 if 50 <= duration <= 85 else max(0, 12 - abs(duration - 68) * 0.4)
+              score = max(0, 55 * (1 - min(1.0, lyric_wer))) + min(20, hook * 5) + keywords * 2 + dur_score
+              rows.append({"file": str(master), "duration": duration, "transcript": transcript, "wer": lyric_wer, "hook_count": hook, "keywords": keywords, "score": score})
+
+          rows.sort(key=lambda r: r["score"], reverse=True)
+          best = Path(rows[0]["file"])
+          shutil.copy2(best, OUT / "Afraid_of_the_Dark_Best_Render.mp3")
+          subprocess.run([
+              "ffmpeg", "-y", "-loglevel", "error", "-ss", "8", "-t", "30", "-i", str(best),
+              "-codec:a", "libmp3lame", "-b:a", "192k", str(OUT / "Afraid_of_the_Dark_Best_Preview.mp3")
+          ], check=True)
+          (OUT / "Analysis.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+          lines = [f"Selected models: {selection}", ""]
+          for idx, row in enumerate(rows, 1):
+              lines.append(f"{idx}. {Path(row['file']).name}: score={row['score']:.2f}, duration={row['duration']:.1f}, WER={row['wer']:.3f}, hook={row['hook_count']}")
+              lines.append(f"Transcript: {row['transcript']}")
+              lines.append("")
+          (OUT / "Analysis.txt").write_text("\n".join(lines), encoding="utf-8")
+          print("\n".join(lines))
+          PY
+          python run.py
+          find final raw -maxdepth 2 -type f -printf '%p %s bytes\n'
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: afraid-dark-server-final
+          path: final/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afraid-dark-server-diagnostics
+          path: raw/
+          if-no-files-found: warn
+          retention-days: 3
