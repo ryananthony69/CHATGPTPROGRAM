@@ -1,0 +1,375 @@
+name: Song Model Shootout
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/song_model_shootout.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish run identifier
+        run: |
+          mkdir -p .songlab
+          printf '%s' "$GITHUB_RUN_ID" > .songlab/run-id.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .songlab/run-id.txt
+          git commit -m "Record temporary song render run" || true
+          git push
+
+  generate:
+    needs: register
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [ace_xl, heartmula, diffrhythm2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Install client and audio tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install -q --upgrade pip
+          python -m pip install -q --upgrade gradio_client requests soundfile numpy
+
+      - name: Generate candidate
+        env:
+          MODEL: ${{ matrix.model }}
+        run: |
+          cat > render.py <<'PY'
+          import base64
+          import json
+          import os
+          import shutil
+          import traceback
+          from pathlib import Path
+
+          from gradio_client import Client
+
+          MODEL = os.environ["MODEL"]
+          OUT = Path("out") / MODEL
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          LYRICS = """[Intro]
+          Turn it on.
+          No, seriously.
+
+          [Verse]
+          Hoodie on the chair,
+          Why you standing there?
+          I know you're just a sleeve,
+          But tonight I don't believe.
+          Cat is staring past my head,
+          Then he slowly leaves the bed.
+          If he sees what I can't see,
+          That feels personal to me.
+
+          [Prechorus]
+          I can pay the rent on time.
+          I can change a tire just fine.
+          But the hallway after two?
+          Absolutely not. No thank you.
+
+          [Chorus]
+          Turn on the light, turn on the light.
+          Everything gets taller in the middle of the night.
+          Turn on the light, turn on the light.
+          I'm brave enough tomorrow, but I'm busy tonight.
+
+          [Verse]
+          Phone at one percent,
+          Charger by the vent.
+          Six feet from the bed,
+          Might as well be miles ahead.
+          Roomba starts at three,
+          Something's chasing me.
+          If a ghost lives here rent-free,
+          It can split the gas with me.
+
+          [Bridge]
+          Basement pull-chain,
+          That design is insane.
+          Kill the light and run upstairs,
+          While pretending no one cares.
+          Ghost, if you're staying here,
+          Rent is due this year.
+          You can haunt the kitchen free,
+          But you're splitting gas with me.
+
+          [Final Chorus]
+          Turn on the light, turn on the light.
+          Everything gets taller in the middle of the night.
+          Turn on the light, turn on the light.
+          I'm brave enough tomorrow, but I'm busy tonight.
+
+          [Outro]
+          It was the cat.
+          """
+
+          ACE_PROMPT = (
+              "catchy upbeat 2000s power-pop and pop-rock, natural expressive adult male lead singer, "
+              "slightly nervous verses and a huge melodic singalong chorus, bright crunchy electric guitars, "
+              "live punchy drums, melodic bass, subtle spooky organ, tight backing harmonies, polished modern mix, "
+              "dry humor delivered sincerely, clear intelligible English lyrics, immediate guitar hook, dynamic arrangement; "
+              "no spoken word, no narration, no rap, no robotic voice, no vocoder, no metal growls, no horror screams"
+          )
+          HEART_TAGS = "electric guitar,drums,bass,keyboard,rock,pop,energetic,happy,uplifting,powerful"
+          DIFF_PROMPT = "Power pop, pop rock, male vocal, electric guitar, bass, live drums, upbeat, catchy, clear vocal, humorous"
+
+          (OUT / "Lyrics.txt").write_text(LYRICS, encoding="utf-8")
+          (OUT / "Prompt.txt").write_text(ACE_PROMPT, encoding="utf-8")
+
+          def save_result(value, stem="candidate"):
+              # Gradio outputs can be paths, file dicts, tuples, or data URLs.
+              if isinstance(value, (list, tuple)):
+                  for idx, item in enumerate(value):
+                      try:
+                          p = save_result(item, f"{stem}_{idx}")
+                          if p:
+                              return p
+                      except Exception:
+                          pass
+                  return None
+              if isinstance(value, dict):
+                  for key in ("path", "name", "url", "audio"):
+                      if key in value:
+                          try:
+                              p = save_result(value[key], stem)
+                              if p:
+                                  return p
+                          except Exception:
+                              pass
+                  return None
+              if value is None:
+                  return None
+              s = str(value)
+              if s.startswith("data:audio/") and ";base64," in s:
+                  header, encoded = s.split(",", 1)
+                  ext = "wav" if "wav" in header else "mp3"
+                  dest = OUT / f"{stem}.{ext}"
+                  dest.write_bytes(base64.b64decode(encoded))
+                  return dest
+              src = Path(s)
+              if src.exists() and src.is_file():
+                  ext = src.suffix or ".wav"
+                  dest = OUT / f"{stem}{ext}"
+                  shutil.copy2(src, dest)
+                  return dest
+              if s.startswith("http://") or s.startswith("https://"):
+                  import requests
+                  r = requests.get(s, timeout=180)
+                  r.raise_for_status()
+                  ctype = r.headers.get("content-type", "")
+                  ext = ".wav" if "wav" in ctype else ".mp3"
+                  dest = OUT / f"{stem}{ext}"
+                  dest.write_bytes(r.content)
+                  return dest
+              return None
+
+          report = {"model": MODEL, "success": False}
+          try:
+              if MODEL == "ace_xl":
+                  client = Client("victor/ace-step-jam", verbose=True)
+                  try:
+                      api = client.view_api(return_format="dict")
+                      (OUT / "api.json").write_text(json.dumps(api, indent=2, default=str), encoding="utf-8")
+                  except Exception as e:
+                      (OUT / "api_error.txt").write_text(repr(e), encoding="utf-8")
+                  attempts = [
+                      (ACE_PROMPT, LYRICS, 65.0, 8, 7.0, 72619, "", 0.8),
+                      (ACE_PROMPT, LYRICS, 65.0, 8, 72619),
+                  ]
+                  last = None
+                  for args in attempts:
+                      try:
+                          last = client.predict(*args, api_name="/generate")
+                          break
+                      except Exception as e:
+                          last = e
+                  if isinstance(last, Exception):
+                      raise last
+                  saved = save_result(last, "ace_xl")
+
+              elif MODEL == "heartmula":
+                  errors = []
+                  saved = None
+                  for space, endpoint in [
+                      ("Heartsync/HeartMuLa", "/generate_music_heartmula"),
+                      ("mrfakename/HeartMuLa", "/generate_music"),
+                  ]:
+                      try:
+                          client = Client(space, verbose=True)
+                          try:
+                              api = client.view_api(return_format="dict")
+                              (OUT / f"api_{space.split('/')[-1]}.json").write_text(json.dumps(api, indent=2, default=str), encoding="utf-8")
+                          except Exception:
+                              pass
+                          result = client.predict(LYRICS, HEART_TAGS, 65, 0.85, 50, 1.6, api_name=endpoint)
+                          saved = save_result(result, "heartmula")
+                          if saved:
+                              report["space"] = space
+                              break
+                      except Exception as e:
+                          errors.append(f"{space}: {type(e).__name__}: {e}")
+                  if not saved:
+                      raise RuntimeError(" | ".join(errors))
+
+              elif MODEL == "diffrhythm2":
+                  client = Client("ASLP-lab/DiffRhythm2", verbose=True)
+                  try:
+                      api = client.view_api(return_format="dict")
+                      (OUT / "api.json").write_text(json.dumps(api, indent=2, default=str), encoding="utf-8")
+                  except Exception:
+                      pass
+                  diff_lyrics = "[start]\n" + LYRICS.replace("[Intro]", "[intro]").replace("[Verse]", "[verse]").replace("[Prechorus]", "[bridge]").replace("[Chorus]", "[chorus]").replace("[Bridge]", "[bridge]").replace("[Final Chorus]", "[chorus]").replace("[Outro]", "[outro]") + "\n[end]"
+                  result = client.predict(diff_lyrics, "text", None, DIFF_PROMPT, 72619, False, 24, 1.5, "mp3", "euler", api_name="/infer_music")
+                  saved = save_result(result, "diffrhythm2")
+              else:
+                  raise RuntimeError(f"unknown model {MODEL}")
+
+              if not saved or not Path(saved).exists() or Path(saved).stat().st_size < 10000:
+                  raise RuntimeError(f"No valid audio file returned: {saved}")
+              report.update({"success": True, "file": str(saved), "size": Path(saved).stat().st_size})
+          except Exception as e:
+              report["error"] = f"{type(e).__name__}: {e}"
+              report["traceback"] = traceback.format_exc()
+          (OUT / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+          print(json.dumps(report, indent=2))
+          PY
+          python render.py
+          find out -type f -maxdepth 3 -printf '%p %s bytes\n' || true
+
+      - name: Upload candidate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ matrix.model }}
+          path: out/${{ matrix.model }}/
+          if-no-files-found: warn
+          retention-days: 3
+
+  analyze:
+    needs: generate
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: candidates
+          merge-multiple: true
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install -q --upgrade pip
+          python -m pip install -q faster-whisper jiwer numpy soundfile
+
+      - name: Validate, transcribe, rank, and master
+        run: |
+          cat > analyze.py <<'PY'
+          import json
+          import math
+          import re
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          import numpy as np
+          import soundfile as sf
+          from jiwer import wer
+
+          ROOT = Path("candidates")
+          OUT = Path("final")
+          OUT.mkdir(exist_ok=True)
+          audio_files = [p for p in ROOT.rglob("*") if p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg"} and p.stat().st_size > 10000]
+          lyrics_files = list(ROOT.rglob("Lyrics.txt"))
+          lyrics = lyrics_files[0].read_text(encoding="utf-8") if lyrics_files else ""
+
+          def norm(s):
+              s = re.sub(r"\[[^]]+\]", " ", s.lower())
+              s = re.sub(r"[^a-z0-9' ]+", " ", s)
+              return " ".join(s.split())
+
+          expected = norm(lyrics)
+          try:
+              from faster_whisper import WhisperModel
+              whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+          except Exception:
+              whisper = None
+
+          rows = []
+          for p in audio_files:
+              name = p.stem
+              master = OUT / f"{name}_mastered.mp3"
+              subprocess.run([
+                  "ffmpeg", "-y", "-loglevel", "error", "-i", str(p),
+                  "-af", "highpass=f=35,loudnorm=I=-14:TP=-1.0:LRA=10",
+                  "-codec:a", "libmp3lame", "-b:a", "256k", str(master)
+              ], check=True)
+              probe = subprocess.check_output([
+                  "ffprobe", "-v", "error", "-show_entries", "format=duration,size",
+                  "-of", "json", str(master)
+              ], text=True)
+              meta = json.loads(probe)["format"]
+              duration = float(meta.get("duration", 0))
+              transcript = ""
+              if whisper:
+                  try:
+                      segs, info = whisper.transcribe(str(master), beam_size=3, vad_filter=True, language="en")
+                      transcript = " ".join(seg.text.strip() for seg in segs).strip()
+                  except Exception as e:
+                      transcript = f"[transcription failed: {e}]"
+              clean_transcript = norm(transcript)
+              lyric_wer = wer(expected, clean_transcript) if expected and clean_transcript and not transcript.startswith("[") else 2.0
+              hook = clean_transcript.count("turn on the light")
+              keywords = sum(1 for k in ["hoodie", "chair", "cat", "roomba", "ghost", "light"] if k in clean_transcript)
+              duration_score = 12 if 45 <= duration <= 90 else max(0, 12 - abs(duration - 65) * 0.4)
+              adherence = max(0, 55 * (1 - min(1.0, lyric_wer)))
+              score = adherence + min(18, hook * 6) + keywords * 2 + duration_score
+              rows.append({
+                  "source": str(p), "master": str(master), "duration": duration,
+                  "transcript": transcript, "wer": lyric_wer, "hook_count": hook,
+                  "keyword_count": keywords, "score": score
+              })
+
+          rows.sort(key=lambda x: x["score"], reverse=True)
+          if not rows:
+              raise SystemExit("No valid candidate audio was produced")
+          best = Path(rows[0]["master"])
+          shutil.copy2(best, OUT / "Afraid_of_the_Dark_Best_Render.mp3")
+          subprocess.run([
+              "ffmpeg", "-y", "-loglevel", "error", "-ss", "10", "-t", "30", "-i", str(best),
+              "-codec:a", "libmp3lame", "-b:a", "192k", str(OUT / "Afraid_of_the_Dark_Best_Preview.mp3")
+          ], check=True)
+          (OUT / "Lyrics.txt").write_text(lyrics, encoding="utf-8")
+          (OUT / "Analysis.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+          report_lines = ["Candidate ranking (automatic intelligibility/integrity check):"]
+          for i, row in enumerate(rows, 1):
+              report_lines.append(f"{i}. {Path(row['master']).name}: score={row['score']:.2f}, duration={row['duration']:.1f}s, WER={row['wer']:.3f}, hook={row['hook_count']}")
+              report_lines.append(f"   transcript: {row['transcript']}")
+          (OUT / "Analysis.txt").write_text("\n".join(report_lines), encoding="utf-8")
+          print("\n".join(report_lines))
+          PY
+          python analyze.py
+          ls -lh final
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: afraid-dark-final-shootout
+          path: final/
+          if-no-files-found: error
+          retention-days: 7
