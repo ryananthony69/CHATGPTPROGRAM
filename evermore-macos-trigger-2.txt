@@ -1,0 +1,1 @@
+Trigger corrected Intel macOS Android emulator run.
