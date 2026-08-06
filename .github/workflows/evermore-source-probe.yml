@@ -1,4 +1,4 @@
-name: Evermore source probe
+name: Aurora Store source inspection
 
 on:
   push:
@@ -10,168 +10,67 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-    env:
-      PKG: com.evermoregames.evermorearcade
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Probe QooApp registration, metadata, and download endpoints
+      - name: Clone current Aurora Store source
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p artifacts
-          python3 - <<'PY'
-          import json, os, secrets
-          from urllib.parse import urlencode
-          import requests
+          git clone --depth 1 https://gitlab.com/AuroraOSS/AuroraStore.git /tmp/AuroraStore
+          cd /tmp/AuroraStore
+          git rev-parse HEAD
 
-          pkg = os.environ['PKG']
-          device = secrets.token_hex(8)
-          legacy_device = '80e65e35094bedcc'
-          legacy_token = '049b1432e342d571a01235ec1d6a91f61fc1db2e'
-          results = []
+      - name: Extract login, download, storage, and installer implementation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts/source-files
+          cd /tmp/AuroraStore
 
-          def clean_headers(headers):
-              keep = {'content-type','content-length','location','server','date','x-request-id','cf-ray'}
-              return {k:v for k,v in headers.items() if k.lower() in keep}
+          find app/src/main/java -type f \( -iname '*Auth*' -o -iname '*Dispenser*' -o -iname '*Onboard*' -o -iname '*Download*' -o -iname '*Install*' \) \
+            -print | sort | tee "$GITHUB_WORKSPACE/artifacts/relevant-file-list.txt"
 
-          def record(name, method, url, **kwargs):
-              kwargs.setdefault('timeout', 35)
-              kwargs.setdefault('allow_redirects', False)
-              try:
-                  r = requests.request(method, url, **kwargs)
-                  item = {
-                      'name': name,
-                      'method': method,
-                      'requested_url': r.request.url,
-                      'request_headers': {k:v for k,v in r.request.headers.items() if k.lower() not in {'authorization','cookie'}},
-                      'request_body': (r.request.body.decode(errors='replace') if isinstance(r.request.body, bytes) else r.request.body),
-                      'status': r.status_code,
-                      'headers': clean_headers(r.headers),
-                      'body': r.text[:4000],
-                      'body_hex_64': r.content[:64].hex(),
-                  }
-              except Exception as exc:
-                  item = {'name': name, 'method': method, 'url': url, 'error': f'{type(exc).__name__}: {exc}'}
-              results.append(item)
-              print('\n===', name, '===')
-              print(json.dumps(item, indent=2, ensure_ascii=False))
-              return item
+          grep -RInE --include='*.kt' --include='*.java' \
+            'Anonymous|anonymous|dispenser|TokenDispenser|token dispenser|downloadPath|getExternalFilesDir|externalCacheDir|cacheDir|filesDir|DownloadManager|PackageInstaller|installPackage|split.*apk|splitApk|bundle' \
+            app/src/main/java \
+            | head -n 6000 > "$GITHUB_WORKSPACE/artifacts/relevant-grep.txt" || true
 
-          versions = [('8.1.6',316), ('8.1.7',317), ('9.0.0',90000), ('9.3.0',90300)]
-          base_form = {
-              'device_id': device,
-              'platform_access_token': device,
-              'type': '4',
-              'email': 'null',
-          }
+          grep -RInE --include='*.xml' \
+            'Anonymous|anonymous|Login|login|Next|Finish|Install|Download|Get started|Terms|Privacy' \
+            app/src/main/res \
+            | head -n 3000 > "$GITHUB_WORKSPACE/artifacts/relevant-resources.txt" || true
 
-          for ver, code in versions:
-              headers = {'User-Agent': f'QooApp {ver}', 'Device-Id': device, 'Accept-Encoding': 'gzip'}
-              form = dict(base_form, version_code=str(code))
-              record(f'reg-form-{ver}', 'POST', 'https://api.qoo-app.com/v6/users',
-                     params={'version_code': code}, data=form, headers=headers)
-              record(f'reg-json-{ver}', 'POST', 'https://api.qoo-app.com/v6/users',
-                     params={'version_code': code}, json=form, headers=headers)
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            safe=$(printf '%s' "$file" | sed 's#/#__#g')
+            cp "$file" "$GITHUB_WORKSPACE/artifacts/source-files/$safe"
+          done < "$GITHUB_WORKSPACE/artifacts/relevant-file-list.txt"
 
-          rich_form = {
-              'device_id': device,
-              'platform_access_token': device,
-              'type': '4',
-              'email': '',
-              'version_code': '317',
-              'version_name': '8.1.7',
-              'package_id': 'com.qooapp.qoohelper',
-              'android_id': device,
-              'uuid': secrets.token_hex(16),
-              'adid': secrets.token_hex(16),
-              'locale': 'en',
-              'system_locale': 'en_US',
-              'sdk_version': '31',
-              'device': 'oriole',
-              'device_model': 'Pixel 6',
-              'os': 'android 12',
-              'patch_code': '48',
-          }
-          rich_headers = {'User-Agent':'QooApp 8.1.7','Device-Id':device,'Accept-Encoding':'gzip'}
-          for endpoint in ['v6/users','v7/users','v8/users','v9/users','v10/users']:
-              record(f'rich-{endpoint}', 'POST', f'https://api.qoo-app.com/{endpoint}',
-                     params={'version_code':317}, data=rich_form, headers=rich_headers)
+          find app/src/main/java/com/aurora/store/data -type f -iname '*.kt' -print0 \
+            | xargs -0 grep -IlE 'DownloadManager|PackageInstaller|getExternalFilesDir|externalCacheDir|cacheDir|filesDir|split.*apk|bundle' \
+            | while IFS= read -r file; do
+                safe=$(printf '%s' "$file" | sed 's#/#__#g')
+                cp "$file" "$GITHUB_WORKSPACE/artifacts/source-files/$safe"
+              done
 
-          info_params = {
-              'supported_abis':'arm64-v8a,armeabi-v7a',
-              'sdk_version':'31',
-              'version_code':'317',
-              'locale':'en',
-              'device':'oriole',
-              'device_model':'Pixel 6',
-              'screen':'1080,2400',
-              'density':'420',
-              'opengl':'196610',
-              'rooted':'false',
-          }
-          legacy_headers = {'User-Agent':'QooApp 8.1.7','Device-Id':legacy_device,'X-User-Token':legacy_token,'Accept-Encoding':'gzip'}
-          record('info-legacy-token', 'GET', f'https://api.qoo-app.com/v10/apps/{pkg}', params=info_params, headers=legacy_headers)
-          record('info-no-token', 'GET', f'https://api.qoo-app.com/v10/apps/{pkg}', params=info_params,
-                 headers={'User-Agent':'QooApp 8.1.7','Device-Id':device,'Accept-Encoding':'gzip'})
+          find app/src/main/java/com/aurora/store/viewmodel -type f -iname '*.kt' -print0 \
+            | xargs -0 grep -IlE 'Anonymous|anonymous|dispenser|token|download|install' \
+            | while IFS= read -r file; do
+                safe=$(printf '%s' "$file" | sed 's#/#__#g')
+                cp "$file" "$GITHUB_WORKSPACE/artifacts/source-files/$safe"
+              done
 
-          download_params = {
-              'supported_abis':'arm64-v8a,armeabi-v7a',
-              'device':'oriole',
-              'base_apk_version':'0',
-              'locale':'en',
-              'opengl':'196610',
-              'rooted':'false',
-              'screen':'1080,2400',
-              'userId':'58009610',
-              'device_model':'Pixel 6',
-              'sdk_version':'31',
-              'base_apk_md5':'null',
-              'user_id':'58009610',
-              'version_code':'317',
-              'version_name':'8.1.7',
-              'os':'android 12',
-              'adid':'64d6639f-55fe-4a86-86fa-a5ea31b2adc7',
-              'type':'app',
-              'uuid':'7e86a27e-db1c-4072-a5cc-e4b9b08e0672',
-              'device_id':legacy_device,
-              'package_id':'com.qooapp.qoohelper',
-              'otome':'0',
-              'token':legacy_token,
-              'android_id':legacy_device,
-              'sa_distinct_id':legacy_device,
-              'patch_code':'48',
-              'density':'420',
-              'system_locale':'en_US',
-          }
-          range_headers = dict(legacy_headers, Range='bytes=0-1023')
-          record('download-legacy-full-query', 'GET', f'https://api.qoo-app.com/v6/apps/{pkg}/download',
-                 params=download_params, headers=range_headers, stream=False)
-          no_token_params = dict(download_params)
-          no_token_params.pop('token', None)
-          record('download-no-token', 'GET', f'https://api.qoo-app.com/v6/apps/{pkg}/download',
-                 params=no_token_params, headers={'User-Agent':'QooApp 8.1.7','Device-Id':device,'Range':'bytes=0-1023'}, stream=False)
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/artifacts/source-commit.txt"
+          tar -czf "$GITHUB_WORKSPACE/artifacts/aurora-relevant-source.tar.gz" \
+            -C "$GITHUB_WORKSPACE/artifacts" source-files
+          du -ah "$GITHUB_WORKSPACE/artifacts" | sort -h | tail -n 30
 
-          for url in [
-              'https://d.qoo-apk.com/150473/apk/base.apk',
-              f'https://d.qoo-apk.com/150473/apk/{pkg}.apk',
-              f'https://d.qoo-apk.com/150473/{pkg}.apk',
-              'https://d.qoo-apk.com/150473/apk/150473.apk',
-          ]:
-              record('static-' + url.rsplit('/',1)[-1], 'GET', url,
-                     headers={'User-Agent':'QooApp 8.1.7','Device-Id':device,'Range':'bytes=0-1023'})
-
-          with open('artifacts/qooapp-probe.json','w') as f:
-              json.dump(results, f, indent=2, ensure_ascii=False)
-          PY
-
-      - name: Upload probe
+      - name: Upload source inspection
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evermore-source-probe
+          name: aurora-source-inspection
           path: artifacts
           retention-days: 3
