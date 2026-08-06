@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - evermore-windows-20260806
+  pull_request:
+    branches:
+      - evermore-windows-20260806
   workflow_dispatch:
 
 permissions:
