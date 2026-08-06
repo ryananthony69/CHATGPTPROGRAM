@@ -4,17 +4,10 @@ on:
   push:
     branches:
       - evermore-emulator-20260806
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: evermore-referral-emulator
-  cancel-in-progress: true
 
 jobs:
   open-referral:
