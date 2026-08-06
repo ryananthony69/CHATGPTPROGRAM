@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: evermore-referral-emulator
+  cancel-in-progress: true
+
 jobs:
   open-referral:
     runs-on: ubuntu-latest
@@ -19,8 +23,6 @@ jobs:
     env:
       PKG: com.evermoregames.evermorearcade
       REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
-      APKCOMBO_PAGE: https://apkcombo.com/evermore-arcade-win-cash/com.evermoregames.evermorearcade/download/apk
-      FALLBACK_REDIRECT: https://apkcombo.com/d?u=aHR0cHM6Ly96dHAtcGV3LmFwa2NvbWJvLmNvbS94YXBrL2NvbS5ldmVybW9yZWdhbWVzLmV2ZXJtb3JlYXJjYWRlLzE1YzIyNDNiZjFhNjRmNjZhYjc4Njc4M2IyOTgyNTZhL2Rvd25sb2FkP25hbWU9Y29tLmV2ZXJtb3JlZ2FtZXMuZXZlcm1vcmVhcmNhZGVfMC4xLjY0LnhhcGs%3D
 
     steps:
       - name: Check out branch
@@ -33,58 +35,41 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - name: Download an Evermore XAPK
+      - name: Download Evermore from Google Play
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p artifacts /tmp/evermore-download
-          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36'
-          PAGE_FILE=/tmp/evermore-download/page.html
-          XAPK=/tmp/evermore.xapk
+          mkdir -p artifacts /tmp/evermore-play
+          python3 -m venv /tmp/gplaydl-venv
+          /tmp/gplaydl-venv/bin/python -m pip install --disable-pip-version-check 'gplaydl==2.1.5'
 
-          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-            --max-time 180 -A "$UA" "$APKCOMBO_PAGE" -o "$PAGE_FILE" || true
+          set +e
+          /tmp/gplaydl-venv/bin/gplaydl auth --arch arm64 2>&1 | tee artifacts/gplay-auth.txt
+          AUTH_RC=${PIPESTATUS[0]}
+          /tmp/gplaydl-venv/bin/gplaydl info "$PKG" 2>&1 | tee artifacts/gplay-info.txt
+          INFO_RC=${PIPESTATUS[0]}
+          /tmp/gplaydl-venv/bin/gplaydl download "$PKG" -o /tmp/evermore-play -a arm64 2>&1 | tee artifacts/gplay-download.txt
+          DOWNLOAD_RC=${PIPESTATUS[0]}
+          set -e
 
-          python3 - <<'PY' > /tmp/evermore-download/candidates.txt
-          import html, re
-          from pathlib import Path
-          page = Path('/tmp/evermore-download/page.html')
-          text = page.read_text(errors='ignore') if page.exists() else ''
-          seen = set()
-          for raw in re.findall(r'href=["\']([^"\']+)["\']', text):
-              link = html.unescape(raw)
-              if '/d?u=' not in link:
-                  continue
-              if link.startswith('/'):
-                  link = 'https://apkcombo.com' + link
-              if link not in seen:
-                  seen.add(link)
-                  print(link)
-          PY
-          printf '%s\n' "$FALLBACK_REDIRECT" >> /tmp/evermore-download/candidates.txt
+          echo "auth_rc=$AUTH_RC info_rc=$INFO_RC download_rc=$DOWNLOAD_RC" | tee artifacts/download-status.txt
+          find /tmp/evermore-play -maxdepth 3 -type f -printf '%s %p\n' | sort -n | tee artifacts/downloaded-files.txt
 
-          downloaded=0
-          while IFS= read -r candidate; do
-            [ -n "$candidate" ] || continue
-            echo "Trying APK source: $candidate"
-            rm -f "$XAPK"
-            if curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-                --max-time 1200 -A "$UA" -e "$APKCOMBO_PAGE" "$candidate" -o "$XAPK"; then
-              if [ "$(head -c 2 "$XAPK" || true)" = 'PK' ] && unzip -tq "$XAPK" >/dev/null 2>&1; then
-                downloaded=1
-                break
-              fi
-            fi
-          done < /tmp/evermore-download/candidates.txt
+          APK_COUNT=$(find /tmp/evermore-play -type f -iname '*.apk' | wc -l)
+          if [ "$DOWNLOAD_RC" -ne 0 ] || [ "$APK_COUNT" -eq 0 ]; then
+            echo 'Direct Google Play download did not produce APK files; trying EFF apkeep via APKPure.' | tee -a artifacts/download-status.txt
+            docker run --rm -v /tmp/evermore-play:/output ghcr.io/efforg/apkeep:stable \
+              -a "$PKG" -d apk-pure /output 2>&1 | tee artifacts/apkeep-download.txt || true
+            APK_COUNT=$(find /tmp/evermore-play -type f -iname '*.apk' | wc -l)
+          fi
 
-          if [ "$downloaded" -ne 1 ]; then
-            echo 'No valid Evermore XAPK could be downloaded.' | tee artifacts/RESULT.txt
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo 'No Evermore APK files could be downloaded.' | tee artifacts/RESULT.txt
             exit 20
           fi
 
-          ls -lh "$XAPK" | tee artifacts/download.txt
-          sha256sum "$XAPK" | tee -a artifacts/download.txt
-          unzip -l "$XAPK" | head -n 120 | tee artifacts/xapk-contents.txt
+          echo "apk_count=$APK_COUNT" | tee -a artifacts/download-status.txt
+          find /tmp/evermore-play -type f -iname '*.apk' -print0 | xargs -0 sha256sum | tee artifacts/apk-sha256.txt
 
       - name: Write emulator test script
         shell: bash
@@ -92,7 +77,7 @@ jobs:
           cat > run-evermore.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
-          mkdir -p artifacts /tmp/evermore-extracted
+          mkdir -p artifacts
           exec > >(tee artifacts/runner.log) 2>&1
 
           snapshot() {
@@ -114,30 +99,20 @@ jobs:
           adb shell svc wifi enable || true
           adb shell svc data enable || true
 
-          echo '=== Extracting Evermore package ==='
-          unzip -q /tmp/evermore.xapk -d /tmp/evermore-extracted
-          rm -f /tmp/evermore.xapk
-          find /tmp/evermore-extracted -maxdepth 3 -type f -printf '%s %p\n' | sort -n > artifacts/extracted-files.txt
-
-          mapfile -d '' APKS < <(find /tmp/evermore-extracted -type f -iname '*.apk' -print0)
+          mapfile -d '' APKS < <(find /tmp/evermore-play -type f -iname '*.apk' -print0)
           if [ "${#APKS[@]}" -eq 0 ]; then
-            echo 'XAPK contained no APK files.' | tee artifacts/RESULT.txt
+            echo 'Download directory contained no APK files.' | tee artifacts/RESULT.txt
             exit 21
           fi
 
-          echo "Installing ${#APKS[@]} APK split(s)"
+          echo "Installing ${#APKS[@]} APK file(s)"
+          printf '%s\n' "${APKS[@]}" | tee artifacts/install-file-list.txt
           adb install-multiple -r -t -g "${APKS[@]}" | tee artifacts/install.txt
 
-          OBB_DIRS=$(find /tmp/evermore-extracted -type f -iname '*.obb' -printf '%h\n' | sort -u || true)
-          if [ -n "$OBB_DIRS" ]; then
+          while IFS= read -r -d '' obb; do
             adb shell mkdir -p "/sdcard/Android/obb/$PKG"
-            while IFS= read -r dir; do
-              [ -n "$dir" ] || continue
-              find "$dir" -maxdepth 1 -type f -iname '*.obb' -print0 | while IFS= read -r -d '' obb; do
-                adb push "$obb" "/sdcard/Android/obb/$PKG/"
-              done
-            done <<< "$OBB_DIRS"
-          fi
+            adb push "$obb" "/sdcard/Android/obb/$PKG/"
+          done < <(find /tmp/evermore-play -type f -iname '*.obb' -print0)
 
           echo '=== Package verification ==='
           adb shell pm path "$PKG" | tee artifacts/package-paths.txt
