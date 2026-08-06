@@ -1,0 +1,465 @@
+name: Evermore referral via Aurora Store
+
+on:
+  push:
+    branches:
+      - evermore-aurora-emulator-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  open-referral:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AURORA_PKG: com.aurora.store
+      EVERMORE_PKG: com.evermoregames.evermorearcade
+      REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
+      AURORA_APK_URL: https://f-droid.org/repo/com.aurora.store_75.apk
+
+    steps:
+      - name: Enable KVM access
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Download current Aurora Store
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/aurora
+          curl --fail --location --retry 6 --retry-all-errors \
+            --connect-timeout 30 --max-time 600 \
+            "$AURORA_APK_URL" -o /tmp/aurora/AuroraStore.apk
+          test "$(head -c 2 /tmp/aurora/AuroraStore.apk)" = 'PK'
+          unzip -tq /tmp/aurora/AuroraStore.apk >/dev/null
+          ls -lh /tmp/aurora/AuroraStore.apk | tee artifacts/aurora-download.txt
+          sha256sum /tmp/aurora/AuroraStore.apk | tee -a artifacts/aurora-download.txt
+
+      - name: Write emulator controller
+        shell: bash
+        run: |
+          cat > /tmp/run-evermore-aurora.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/aurora-pulled
+          exec > >(tee artifacts/runner.log) 2>&1
+
+          adb wait-for-device
+          until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; do sleep 2; done
+
+          echo '=== Emulator identity ==='
+          adb shell getprop > artifacts/getprop.txt
+          adb shell getprop ro.build.version.release
+          adb shell getprop ro.build.version.sdk
+          adb shell getprop ro.product.cpu.abilist
+          adb shell getprop ro.dalvik.vm.native.bridge
+          adb shell wm size
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell settings put system system_locales en-US || true
+          adb shell svc wifi enable || true
+          adb shell svc data enable || true
+
+          echo '=== Install and authorize Aurora Store ==='
+          adb install -r -g /tmp/aurora/AuroraStore.apk | tee artifacts/aurora-install.txt
+          adb shell pm grant "$AURORA_PKG" android.permission.READ_EXTERNAL_STORAGE || true
+          adb shell pm grant "$AURORA_PKG" android.permission.WRITE_EXTERNAL_STORAGE || true
+          adb shell appops set "$AURORA_PKG" MANAGE_EXTERNAL_STORAGE allow || true
+          adb shell appops set "$AURORA_PKG" REQUEST_INSTALL_PACKAGES allow || true
+          adb shell appops set "$AURORA_PKG" RUN_IN_BACKGROUND allow || true
+          adb shell appops set "$AURORA_PKG" RUN_ANY_IN_BACKGROUND allow || true
+          adb shell dumpsys deviceidle whitelist +"$AURORA_PKG" || true
+          adb shell settings put global package_verifier_enable 0 || true
+          adb shell settings put global verifier_verify_adb_installs 0 || true
+          adb shell dumpsys package "$AURORA_PKG" > artifacts/aurora-package.txt
+
+          cat > /tmp/aurora_driver.py <<'PY'
+          import os
+          import re
+          import subprocess
+          import time
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          ART = Path('artifacts')
+          ART.mkdir(exist_ok=True)
+          AURORA = os.environ['AURORA_PKG']
+          TARGET = os.environ['EVERMORE_PKG']
+          REFERRAL = os.environ['REFERRAL_URL']
+          event_log = ART / 'ui-events.txt'
+          snapshot_index = 0
+
+          def run(args, timeout=60, check=False, text=True):
+              p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 timeout=timeout, check=False, text=text)
+              if check and p.returncode:
+                  raise RuntimeError(f"command failed {p.returncode}: {args}\n{p.stdout}")
+              return p.stdout if text else p.stdout
+
+          def adb(*args, timeout=60, check=False, text=True):
+              return run(['adb', *args], timeout=timeout, check=check, text=text)
+
+          def log(message):
+              line = f"{time.strftime('%H:%M:%S')} {message}"
+              print(line, flush=True)
+              with event_log.open('a', encoding='utf-8') as f:
+                  f.write(line + '\n')
+
+          def activity():
+              out = adb('shell', 'dumpsys', 'activity', 'activities')
+              for pattern in [r'mResumedActivity:.*? ([^ ]+)', r'topResumedActivity=.*? ([^ ]+)']:
+                  m = re.search(pattern, out)
+                  if m:
+                      return m.group(1)
+              return ''
+
+          def dump_xml(tag='window'):
+              remote = '/sdcard/window.xml'
+              adb('shell', 'uiautomator', 'dump', remote, timeout=20)
+              local = Path('/tmp/window.xml')
+              adb('pull', remote, str(local), timeout=20)
+              try:
+                  root = ET.parse(local).getroot()
+              except Exception as exc:
+                  log(f'XML parse failed: {exc}')
+                  return [], ''
+              nodes = []
+              visible = []
+              for node in root.iter('node'):
+                  a = node.attrib
+                  text = a.get('text', '')
+                  desc = a.get('content-desc', '')
+                  rid = a.get('resource-id', '')
+                  label = ' '.join(x for x in [text, desc, rid] if x)
+                  if text or desc:
+                      visible.append(text or desc)
+                  bounds = a.get('bounds', '')
+                  m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
+                  if not m:
+                      continue
+                  x1, y1, x2, y2 = map(int, m.groups())
+                  nodes.append({
+                      'text': text, 'desc': desc, 'rid': rid, 'label': label,
+                      'class': a.get('class', ''), 'clickable': a.get('clickable') == 'true',
+                      'enabled': a.get('enabled') != 'false', 'checked': a.get('checked') == 'true',
+                      'x': (x1+x2)//2, 'y': (y1+y2)//2,
+                      'bounds': bounds,
+                  })
+              return nodes, ' | '.join(visible)
+
+          def snapshot(name):
+              global snapshot_index
+              snapshot_index += 1
+              safe = re.sub(r'[^A-Za-z0-9._-]+', '-', name).strip('-')[:70]
+              prefix = f"{snapshot_index:03d}-{safe}"
+              png = adb('exec-out', 'screencap', '-p', timeout=30, text=False)
+              (ART / f'{prefix}.png').write_bytes(png)
+              adb('shell', 'uiautomator', 'dump', '/sdcard/window.xml', timeout=20)
+              adb('pull', '/sdcard/window.xml', str(ART / f'{prefix}.xml'), timeout=20)
+              log(f'snapshot={prefix} activity={activity()}')
+
+          def tap(node, reason):
+              adb('shell', 'input', 'tap', str(node['x']), str(node['y']))
+              log(f"tap {reason}: {node['label']!r} {node['bounds']}")
+              time.sleep(2)
+              return True
+
+          def find_node(nodes, patterns, exact=False, avoid=()):
+              compiled = [re.compile(p, re.I) for p in patterns]
+              avoid_c = [re.compile(p, re.I) for p in avoid]
+              candidates = []
+              for node in nodes:
+                  if not node['enabled']:
+                      continue
+                  label = node['label'].strip()
+                  if any(p.search(label) for p in avoid_c):
+                      continue
+                  matched = any((p.fullmatch(label) if exact else p.search(label)) for p in compiled)
+                  if matched:
+                      score = (0 if node['clickable'] else 1, -len(label), node['y'])
+                      candidates.append((score, node))
+              return sorted(candidates, key=lambda item: item[0])[0][1] if candidates else None
+
+          def click(nodes, patterns, reason, exact=False, avoid=()):
+              node = find_node(nodes, patterns, exact=exact, avoid=avoid)
+              return tap(node, reason) if node else False
+
+          def click_unchecked_consent(nodes):
+              for node in nodes:
+                  label = node['label']
+                  if node['checked']:
+                      continue
+                  if ('CheckBox' in node['class'] or 'Switch' in node['class']) and re.search(
+                      r'agree|terms|privacy|license|permission|install|storage|read', label, re.I
+                  ):
+                      return tap(node, 'consent/permission checkbox')
+              return False
+
+          def system_dialog_step(nodes, visible):
+              current = activity()
+              if 'permissioncontroller' in current.lower() or 'packageinstaller' in current.lower():
+                  if click(nodes, [r'^Allow$', r'While using', r'Allow all', r'^Install$', r'^Continue$',
+                                   r'^OK$', r'^Done$', r'Use this folder'], 'system positive action',
+                           avoid=[r"Don.t allow", r'^Cancel$']):
+                      return True
+              if 'settings' in current.lower():
+                  if click(nodes, [r'Allow from this source', r'Permit installing', r'^Allow$'],
+                           'unknown-source switch', avoid=[r'Not allowed']):
+                      return True
+                  adb('shell', 'input', 'keyevent', '4')
+                  log('back from settings')
+                  time.sleep(2)
+                  return True
+              return False
+
+          def onboard_and_login():
+              adb('shell', 'monkey', '-p', AURORA, '-c', 'android.intent.category.LAUNCHER', '1')
+              time.sleep(4)
+              anonymous_tries = 0
+              idle = 0
+              for i in range(180):
+                  nodes, visible = dump_xml()
+                  if i % 5 == 0:
+                      snapshot(f'aurora-{i:03d}')
+                  log(f"screen[{i}] {visible[:800]}")
+
+                  lower = visible.lower()
+                  if TARGET.lower() in lower or ('games' in lower and 'apps' in lower and 'updates' in lower):
+                      log('Aurora home/details detected')
+                      return True
+
+                  if system_dialog_step(nodes, visible):
+                      idle = 0
+                      continue
+
+                  if click_unchecked_consent(nodes):
+                      idle = 0
+                      continue
+
+                  if re.search(r'anonymous', visible, re.I):
+                      if click(nodes, [r'^Anonymous$'], 'anonymous login', exact=True,
+                               avoid=[r'insecure', r'Google', r'personal']):
+                          anonymous_tries += 1
+                          idle = 0
+                          time.sleep(8)
+                          continue
+
+                  if click(nodes, [r'^Next$', r'Continue', r'Get started', r'^Accept$', r'^Agree$',
+                                   r'^Finish$', r'^Grant$', r'^Allow$', r'^OK$', r'^Done$'],
+                           'onboarding positive action',
+                           avoid=[r'Google', r'personal', r'insecure', r'Deny', r"Don.t allow", r'Cancel']):
+                      idle = 0
+                      continue
+
+                  if click(nodes, [r'Navigate up', r'Forward', r'arrow_forward', r'chevron_right'],
+                           'onboarding navigation'):
+                      idle = 0
+                      continue
+
+                  idle += 1
+                  if idle == 4:
+                      adb('shell', 'input', 'swipe', '900', '1200', '200', '1200', '350')
+                      log('swipe onboarding page')
+                  if idle >= 8 and anonymous_tries:
+                      adb('shell', 'am', 'force-stop', AURORA)
+                      adb('shell', 'monkey', '-p', AURORA, '1')
+                      log('restart Aurora after login wait')
+                      idle = 0
+                  time.sleep(2)
+              return False
+
+          def open_target_details():
+              urls = [
+                  f'market://details?id={TARGET}',
+                  f'https://play.google.com/store/apps/details?id={TARGET}',
+              ]
+              for url in urls:
+                  out = adb('shell', 'am', 'start', '-W', '-a', 'android.intent.action.VIEW',
+                            '-d', url, '-p', AURORA)
+                  log(f'deep link {url}: {out.strip()[:500]}')
+                  time.sleep(12)
+                  snapshot('aurora-target-details')
+                  nodes, visible = dump_xml()
+                  if re.search(r'Evermore|Install|Download', visible, re.I):
+                      return True
+
+              adb('shell', 'monkey', '-p', AURORA, '1')
+              time.sleep(5)
+              adb('shell', 'input', 'keyevent', '84')
+              time.sleep(2)
+              adb('shell', 'input', 'text', TARGET)
+              adb('shell', 'input', 'keyevent', '66')
+              log('manual Aurora package search submitted')
+              time.sleep(15)
+              snapshot('aurora-search-results')
+              nodes, visible = dump_xml()
+              if click(nodes, [r'Evermore Arcade', re.escape(TARGET)], 'Evermore search result'):
+                  time.sleep(10)
+                  snapshot('aurora-search-result-opened')
+                  return True
+              return False
+
+          def target_installed():
+              return 'package:' in adb('shell', 'pm', 'path', TARGET)
+
+          def download_and_install():
+              last_click = 0
+              for i in range(240):
+                  if target_installed():
+                      log('Evermore package installed')
+                      return True
+                  nodes, visible = dump_xml()
+                  if i % 10 == 0:
+                      snapshot(f'download-{i:03d}')
+                      log(f'download screen: {visible[:800]}')
+
+                  if system_dialog_step(nodes, visible):
+                      continue
+
+                  now = time.time()
+                  if now - last_click > 8:
+                      if click(nodes, [r'^Install$', r'^Download$', r'^Get$', r'Install anyway',
+                                       r'^Continue$', r'^Allow$', r'^OK$', r'^Retry$'],
+                               'download/install action',
+                               avoid=[r'Uninstall', r'Cancel', r'Google', r'insecure']):
+                          last_click = now
+                          time.sleep(5)
+                          continue
+
+                  if re.search(r'Evermore Arcade', visible, re.I) and re.search(r'Open', visible, re.I):
+                      if target_installed():
+                          return True
+
+                  time.sleep(5)
+              return target_installed()
+
+          ok_login = onboard_and_login()
+          snapshot('aurora-after-onboarding')
+          log(f'onboard_login={ok_login}')
+          ok_details = open_target_details() if ok_login else False
+          log(f'target_details={ok_details}')
+          ok_install = download_and_install() if ok_details else False
+          log(f'ui_install={ok_install}')
+          Path('/tmp/ui-install-result').write_text('1' if ok_install else '0')
+          PY
+
+          python3 /tmp/aurora_driver.py || true
+
+          echo '=== Search Aurora external storage for downloaded package files ==='
+          adb shell find /sdcard -type f 2>/dev/null | tee artifacts/sdcard-files.txt || true
+          if ! adb shell pm path "$EVERMORE_PKG" | grep -q '^package:'; then
+            while IFS= read -r remote; do
+              [ -n "$remote" ] || continue
+              case "$remote" in
+                *.apk|*.apks|*.xapk|*.zip)
+                  safe=$(printf '%s' "$remote" | sed 's#[^A-Za-z0-9._-]#_#g')
+                  adb pull "$remote" "/tmp/aurora-pulled/$safe" || true
+                  ;;
+              esac
+            done < artifacts/sdcard-files.txt
+
+            find /tmp/aurora-pulled -type f -printf '%s %p\n' | sort -n | tee artifacts/pulled-files.txt || true
+            mkdir -p /tmp/aurora-expanded
+            find /tmp/aurora-pulled -type f \( -iname '*.apks' -o -iname '*.xapk' -o -iname '*.zip' \) -print0 | while IFS= read -r -d '' archive; do
+              unzip -o "$archive" -d "/tmp/aurora-expanded/$(basename "$archive")" || true
+            done
+
+            mapfile -d '' CANDIDATES < <(find /tmp/aurora-pulled /tmp/aurora-expanded -type f -iname '*.apk' -print0 2>/dev/null)
+            : > artifacts/apk-inspection.txt
+            MATCHES=()
+            for apk in "${CANDIDATES[@]:-}"; do
+              line=$(aapt dump badging "$apk" 2>/dev/null | head -n1 || true)
+              printf '%s :: %s\n' "$apk" "$line" | tee -a artifacts/apk-inspection.txt
+              if printf '%s' "$line" | grep -q "name='$EVERMORE_PKG'"; then
+                MATCHES+=("$apk")
+              fi
+            done
+            if [ "${#MATCHES[@]}" -gt 0 ]; then
+              adb install-multiple -r -t -g "${MATCHES[@]}" | tee artifacts/fallback-install.txt || true
+            fi
+          fi
+
+          echo '=== Verify Evermore installation ==='
+          adb shell pm path "$EVERMORE_PKG" | tee artifacts/evermore-package-paths.txt || true
+          adb shell dumpsys package "$EVERMORE_PKG" > artifacts/evermore-package.txt || true
+          adb shell cmd package query-activities -a android.intent.action.VIEW \
+            -c android.intent.category.BROWSABLE -d "$REFERRAL_URL" \
+            > artifacts/referral-handlers.txt 2>&1 || true
+
+          if adb shell pm path "$EVERMORE_PKG" | grep -q '^package:'; then
+            echo '=== First Evermore launch ==='
+            adb logcat -c || true
+            adb shell monkey -p "$EVERMORE_PKG" -c android.intent.category.LAUNCHER 1 \
+              | tee artifacts/evermore-first-launch.txt || true
+            sleep 15
+            adb exec-out screencap -p > artifacts/evermore-first-launch.png || true
+            adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/window.xml artifacts/evermore-first-launch.xml >/dev/null 2>&1 || true
+
+            echo '=== Open referral directly in Evermore ==='
+            adb shell am force-stop "$EVERMORE_PKG" || true
+            adb shell am start -W -a android.intent.action.VIEW \
+              -c android.intent.category.BROWSABLE \
+              -d "$REFERRAL_URL" -p "$EVERMORE_PKG" \
+              | tee artifacts/referral-app-scoped.txt || true
+            sleep 10
+            adb exec-out screencap -p > artifacts/referral-10s.png || true
+            adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/window.xml artifacts/referral-10s.xml >/dev/null 2>&1 || true
+            sleep 25
+            adb exec-out screencap -p > artifacts/referral-35s.png || true
+            adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/window.xml artifacts/referral-35s.xml >/dev/null 2>&1 || true
+            INSTALLED=yes
+          else
+            INSTALLED=no
+          fi
+
+          adb shell dumpsys activity activities > artifacts/activities.txt || true
+          adb shell dumpsys window windows > artifacts/windows.txt || true
+          adb logcat -d -v threadtime > artifacts/logcat.txt || true
+          TOP=$(adb shell dumpsys activity activities | sed -n 's/.*mResumedActivity:.* \([^ ]*\) .*/\1/p' | head -n1 | tr -d '\r')
+          {
+            echo "installed=$INSTALLED"
+            echo "package=$EVERMORE_PKG"
+            echo "referral=$REFERRAL_URL"
+            echo "top_activity=$TOP"
+            echo "android=$(adb shell getprop ro.build.version.release | tr -d '\r')"
+            echo "sdk=$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+          } | tee artifacts/RESULT.txt
+          SH
+          chmod +x /tmp/run-evermore-aurora.sh
+
+      - name: Boot Android, fetch Evermore from Google Play, and open referral
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 6144M
+          heap-size: 768M
+          disk-size: 16384M
+          emulator-boot-timeout: 1200
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash /tmp/run-evermore-aurora.sh
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-aurora-emulator-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
