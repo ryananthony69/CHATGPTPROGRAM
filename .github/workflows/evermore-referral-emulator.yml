@@ -12,10 +12,11 @@ permissions:
 jobs:
   open-referral:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 60
     env:
       PKG: com.evermoregames.evermorearcade
       REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
+      QOOAPP_ID: '150473'
 
     steps:
       - name: Check out branch
@@ -28,41 +29,92 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - name: Download Evermore from Google Play
+      - name: Resolve Evermore package from QooApp
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p artifacts /tmp/evermore-play
-          python3 -m venv /tmp/gplaydl-venv
-          /tmp/gplaydl-venv/bin/python -m pip install --disable-pip-version-check 'gplaydl==2.1.5'
+          mkdir -p artifacts /tmp/evermore-apks
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36'
 
-          set +e
-          /tmp/gplaydl-venv/bin/gplaydl auth --arch arm64 2>&1 | tee artifacts/gplay-auth.txt
-          AUTH_RC=${PIPESTATUS[0]}
-          /tmp/gplaydl-venv/bin/gplaydl info "$PKG" 2>&1 | tee artifacts/gplay-info.txt
-          INFO_RC=${PIPESTATUS[0]}
-          /tmp/gplaydl-venv/bin/gplaydl download "$PKG" -o /tmp/evermore-play -a arm64 2>&1 | tee artifacts/gplay-download.txt
-          DOWNLOAD_RC=${PIPESTATUS[0]}
-          set -e
+          curl --silent --show-error --location --compressed \
+            --connect-timeout 30 --max-time 120 \
+            -A "$UA" \
+            -H 'Accept: application/json, text/plain, */*' \
+            -H 'Content-Type: application/json' \
+            -H 'Origin: https://qoopy.leadrdrk.com' \
+            -H 'Referer: https://qoopy.leadrdrk.com/' \
+            --data "{\"id\":\"$QOOAPP_ID\"}" \
+            -D artifacts/qoopy-headers.txt \
+            https://qoopy.leadrdrk.com/api/v2/app \
+            -o artifacts/qoopy-response.json
 
-          echo "auth_rc=$AUTH_RC info_rc=$INFO_RC download_rc=$DOWNLOAD_RC" | tee artifacts/download-status.txt
-          find /tmp/evermore-play -maxdepth 3 -type f -printf '%s %p\n' | sort -n | tee artifacts/downloaded-files.txt
+          python3 - <<'PY'
+          import json, pathlib, sys
+          source = pathlib.Path('artifacts/qoopy-response.json')
+          try:
+              payload = json.loads(source.read_text())
+          except Exception as exc:
+              print(f'Qoopy did not return JSON: {exc}', file=sys.stderr)
+              print(source.read_text(errors='replace')[:2000], file=sys.stderr)
+              raise SystemExit(20)
 
-          APK_COUNT=$(find /tmp/evermore-play -type f -iname '*.apk' | wc -l)
-          if [ "$DOWNLOAD_RC" -ne 0 ] || [ "$APK_COUNT" -eq 0 ]; then
-            echo 'Direct Google Play download did not produce APK files; trying EFF apkeep via APKPure.' | tee -a artifacts/download-status.txt
-            docker run --rm -v /tmp/evermore-play:/output ghcr.io/efforg/apkeep:stable \
-              -a "$PKG" -d apk-pure /output 2>&1 | tee artifacts/apkeep-download.txt || true
-            APK_COUNT=$(find /tmp/evermore-play -type f -iname '*.apk' | wc -l)
-          fi
+          data = payload.get('data') or {}
+          urls = []
+          if data.get('download'):
+              urls.append(('base.apk', data['download']))
+          for index, split in enumerate(data.get('split_apks') or [], 1):
+              url = split.get('url')
+              if url:
+                  urls.append((f'split-{index:03d}.apk', url))
 
-          if [ "$APK_COUNT" -eq 0 ]; then
-            echo 'No Evermore APK files could be downloaded.' | tee artifacts/RESULT.txt
-            exit 20
-          fi
+          summary = {
+              'api_code': payload.get('code'),
+              'api_message': payload.get('message'),
+              'id': data.get('id'),
+              'package_id': data.get('package_id'),
+              'display_name': data.get('display_name'),
+              'version_name': (data.get('apk') or {}).get('version_name'),
+              'version_code': (data.get('apk') or {}).get('version_code'),
+              'is_apk_ready': data.get('is_apk_ready'),
+              'file_count': len(urls),
+          }
+          pathlib.Path('artifacts/qoopy-summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
 
-          echo "apk_count=$APK_COUNT" | tee -a artifacts/download-status.txt
-          find /tmp/evermore-play -type f -iname '*.apk' -print0 | xargs -0 sha256sum | tee artifacts/apk-sha256.txt
+          if data.get('package_id') not in (None, 'com.evermoregames.evermorearcade'):
+              raise SystemExit(f'Unexpected package returned: {data.get("package_id")}')
+          if not urls:
+              raise SystemExit('QooApp entry has no downloadable APK files')
+
+          with open('/tmp/evermore-urls.tsv', 'w') as out:
+              for name, url in urls:
+                  out.write(f'{name}\t{url}\n')
+          PY
+
+      - name: Download Evermore base and split APKs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36'
+          : > artifacts/download-log.txt
+
+          while IFS=$'\t' read -r name url; do
+            [ -n "$name" ] && [ -n "$url" ] || continue
+            echo "Downloading $name" | tee -a artifacts/download-log.txt
+            curl --fail --show-error --location --retry 5 --retry-all-errors \
+              --connect-timeout 45 --max-time 1800 \
+              -A "$UA" -e 'https://m-apps.qoo-app.com/en-US/app/150473' \
+              "$url" -o "/tmp/evermore-apks/$name"
+            file "/tmp/evermore-apks/$name" | tee -a artifacts/download-log.txt
+            test "$(head -c 2 "/tmp/evermore-apks/$name")" = 'PK'
+            unzip -tq "/tmp/evermore-apks/$name" >/dev/null
+          done < /tmp/evermore-urls.tsv
+
+          find /tmp/evermore-apks -type f -iname '*.apk' -printf '%s %f\n' | sort -n | tee artifacts/downloaded-files.txt
+          find /tmp/evermore-apks -type f -iname '*.apk' -print0 | xargs -0 sha256sum | tee artifacts/apk-sha256.txt
+          APK_COUNT=$(find /tmp/evermore-apks -type f -iname '*.apk' | wc -l)
+          [ "$APK_COUNT" -gt 0 ]
+          echo "apk_count=$APK_COUNT" | tee artifacts/download-status.txt
 
       - name: Write emulator test script
         shell: bash
@@ -92,20 +144,10 @@ jobs:
           adb shell svc wifi enable || true
           adb shell svc data enable || true
 
-          mapfile -d '' APKS < <(find /tmp/evermore-play -type f -iname '*.apk' -print0)
-          if [ "${#APKS[@]}" -eq 0 ]; then
-            echo 'Download directory contained no APK files.' | tee artifacts/RESULT.txt
-            exit 21
-          fi
-
+          mapfile -d '' APKS < <(find /tmp/evermore-apks -type f -iname '*.apk' -print0)
           echo "Installing ${#APKS[@]} APK file(s)"
           printf '%s\n' "${APKS[@]}" | tee artifacts/install-file-list.txt
           adb install-multiple -r -t -g "${APKS[@]}" | tee artifacts/install.txt
-
-          while IFS= read -r -d '' obb; do
-            adb shell mkdir -p "/sdcard/Android/obb/$PKG"
-            adb push "$obb" "/sdcard/Android/obb/$PKG/"
-          done < <(find /tmp/evermore-play -type f -iname '*.obb' -print0)
 
           echo '=== Package verification ==='
           adb shell pm path "$PKG" | tee artifacts/package-paths.txt
@@ -115,7 +157,7 @@ jobs:
           echo '=== First launch ==='
           adb logcat -c || true
           adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 | tee artifacts/first-launch.txt || true
-          sleep 12
+          sleep 15
           snapshot 01-first-launch
 
           echo '=== Opening referral as an app-scoped deep link ==='
@@ -123,16 +165,16 @@ jobs:
           adb shell am start -W -a android.intent.action.VIEW \
             -c android.intent.category.BROWSABLE \
             -d "$REFERRAL_URL" -p "$PKG" | tee artifacts/deep-link-app-scoped.txt || true
-          sleep 8
-          snapshot 02-referral-8s
-          sleep 12
-          snapshot 03-referral-20s
+          sleep 10
+          snapshot 02-referral-10s
+          sleep 25
+          snapshot 03-referral-35s
 
           echo '=== Opening referral through Android resolver as fallback ==='
           adb shell am start -W -a android.intent.action.VIEW \
             -c android.intent.category.BROWSABLE \
             -d "$REFERRAL_URL" | tee artifacts/deep-link-generic.txt || true
-          sleep 10
+          sleep 12
           snapshot 04-referral-generic
 
           adb shell dumpsys activity activities > artifacts/activities.txt || true
@@ -161,9 +203,9 @@ jobs:
           arch: x86_64
           profile: pixel_6
           cores: 4
-          ram-size: 4096M
-          heap-size: 512M
-          disk-size: 8192M
+          ram-size: 6144M
+          heap-size: 768M
+          disk-size: 12288M
           emulator-boot-timeout: 900
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
