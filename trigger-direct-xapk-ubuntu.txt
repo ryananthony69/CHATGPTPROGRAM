@@ -1,0 +1,1 @@
+Trigger the registered direct-XAPK Android workflow after replacing Aurora.
