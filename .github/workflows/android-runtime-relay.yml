@@ -1,0 +1,176 @@
+name: Android runtime relay
+
+on:
+  push:
+    branches:
+      - android-runtime-relay-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay-runtime:
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
+    steps:
+      - name: Resolve current stable official Android packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p runtime diagnostics
+          python3 - <<'PY'
+          import json
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers={'User-Agent': 'AndroidSDKManager/1.0'})
+              with urllib.request.urlopen(req, timeout=90) as response:
+                  return response.read()
+
+          def local(tag):
+              return tag.rsplit('}', 1)[-1]
+
+          def child_text(node, name, default=''):
+              for child in node.iter():
+                  if local(child.tag) == name and child.text:
+                      return child.text.strip()
+              return default
+
+          def revision(pkg):
+              rev = next((x for x in pkg if local(x.tag) == 'revision'), None)
+              if rev is None:
+                  return (0, 0, 0, 0)
+              vals = {}
+              for item in rev:
+                  try:
+                      vals[local(item.tag)] = int((item.text or '0').strip())
+                  except ValueError:
+                      vals[local(item.tag)] = 0
+              return (vals.get('major', 0), vals.get('minor', 0),
+                      vals.get('micro', 0), vals.get('preview', 0))
+
+          def channel(pkg):
+              for child in pkg:
+                  if local(child.tag) == 'channelRef':
+                      return child.attrib.get('ref', '')
+              return 'channel-0'
+
+          def archives(pkg, wanted_os=None, wanted_arch=None):
+              output = []
+              for archive in pkg.iter():
+                  if local(archive.tag) != 'archive':
+                      continue
+                  host_os = child_text(archive, 'host-os')
+                  host_arch = child_text(archive, 'host-arch')
+                  if wanted_os and host_os and host_os != wanted_os:
+                      continue
+                  if wanted_arch and host_arch and host_arch != wanted_arch:
+                      continue
+                  complete = next((x for x in archive.iter() if local(x.tag) == 'complete'), None)
+                  if complete is None:
+                      continue
+                  url = child_text(complete, 'url')
+                  if not url:
+                      continue
+                  output.append({
+                      'url': url,
+                      'size': child_text(complete, 'size'),
+                      'checksum': child_text(complete, 'checksum'),
+                      'host_os': host_os,
+                      'host_arch': host_arch,
+                  })
+              return output
+
+          repo_url = 'https://dl.google.com/android/repository/repository2-3.xml'
+          sys_url = 'https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml'
+          repo_bytes = fetch(repo_url)
+          sys_bytes = fetch(sys_url)
+          Path('diagnostics/repository2-3.xml').write_bytes(repo_bytes)
+          Path('diagnostics/google-apis-sys-img2-3.xml').write_bytes(sys_bytes)
+
+          repo_root = ET.fromstring(repo_bytes)
+          emulator_candidates = []
+          for pkg in repo_root.iter():
+              if local(pkg.tag) != 'remotePackage' or pkg.attrib.get('path') != 'emulator':
+                  continue
+              if channel(pkg) not in ('', 'channel-0'):
+                  continue
+              for archive in archives(pkg, 'linux', 'x86_64'):
+                  emulator_candidates.append((revision(pkg), archive))
+          if not emulator_candidates:
+              raise SystemExit('No stable Linux x86_64 emulator archive found')
+          emu_revision, emu_archive = max(emulator_candidates, key=lambda x: x[0])
+
+          sys_root = ET.fromstring(sys_bytes)
+          target_path = 'system-images;android-31;google_apis;x86_64'
+          image_candidates = []
+          for pkg in sys_root.iter():
+              if local(pkg.tag) != 'remotePackage' or pkg.attrib.get('path') != target_path:
+                  continue
+              if channel(pkg) not in ('', 'channel-0'):
+                  continue
+              for archive in archives(pkg):
+                  image_candidates.append((revision(pkg), archive))
+          if not image_candidates:
+              raise SystemExit(f'No stable archive found for {target_path}')
+          image_revision, image_archive = max(image_candidates, key=lambda x: x[0])
+
+          manifest = {
+              'emulator': {
+                  'revision': emu_revision,
+                  **emu_archive,
+                  'absolute_url': 'https://dl.google.com/android/repository/' + emu_archive['url'],
+              },
+              'system_image': {
+                  'package': target_path,
+                  'revision': image_revision,
+                  **image_archive,
+                  'absolute_url': 'https://dl.google.com/android/repository/sys-img/google_apis/' + image_archive['url'],
+              },
+              'platform_tools': {
+                  'absolute_url': 'https://dl.google.com/android/repository/platform-tools-latest-linux.zip'
+              }
+          }
+          Path('diagnostics/manifest.json').write_text(json.dumps(manifest, indent=2))
+          Path('/tmp/emulator-url').write_text(manifest['emulator']['absolute_url'])
+          Path('/tmp/system-image-url').write_text(manifest['system_image']['absolute_url'])
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Download official runtime archives
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EMULATOR_URL=$(cat /tmp/emulator-url)
+          SYSTEM_URL=$(cat /tmp/system-image-url)
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$EMULATOR_URL" -o runtime/emulator-linux-x64.zip
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            https://dl.google.com/android/repository/platform-tools-latest-linux.zip \
+            -o runtime/platform-tools-linux.zip
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 720 \
+            "$SYSTEM_URL" -o runtime/google-apis-x86_64-android-31.zip
+
+          for archive in runtime/*.zip; do
+            test "$(head -c 2 "$archive")" = 'PK'
+            unzip -tq "$archive" >/dev/null
+          done
+          sha256sum runtime/*.zip | tee diagnostics/sha256.txt
+          du -h runtime/*.zip | tee diagnostics/sizes.txt
+
+      - name: Upload official Android runtime
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-emulator-api31-runtime
+          path: |
+            runtime
+            diagnostics/manifest.json
+            diagnostics/sha256.txt
+            diagnostics/sizes.txt
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 3
