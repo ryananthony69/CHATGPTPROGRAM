@@ -1,0 +1,409 @@
+name: Evermore direct XAPK Android emulator
+
+on:
+  push:
+    branches:
+      - evermore-direct-xapk-macos-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  open-referral:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      PKG: com.evermoregames.evermorearcade
+      REFERRAL_URI: evermorearcade://referral?code=J32R6Q
+      REFERRAL_PAGE: https://evermoregamesllc.com/referral?code=J32R6Q
+      APKCOMBO_PAGE: https://apkcombo.com/evermore-arcade-win-cash/com.evermoregames.evermorearcade/download/apk
+      KNOWN_XAPK_URL: https://ztp-pew.apkcombo.com/xapk/com.evermoregames.evermorearcade/15c2243bf1a64f66ab786783b298256a/download?name=com.evermoregames.evermorearcade_0.1.64.xapk
+
+    steps:
+      - name: Download official Intel Android runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/runtime /tmp/evermore-unpacked
+          export ANDROID_SDK_ROOT="$RUNNER_TEMP/android-sdk"
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          mkdir -p "$ANDROID_SDK_ROOT"
+          printf 'runner=%s\nmacos=%s\narch=%s\n' '${{ matrix.os }}' \
+            "$(sw_vers -productVersion)" "$(uname -m)" | tee artifacts/host.txt
+          test "$(uname -m)" = x86_64
+
+          python3 - <<'PY'
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          def fetch(url):
+              request = urllib.request.Request(url, headers={'User-Agent': 'AndroidSDKManager/1.0'})
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  return response.read().decode('utf-8', 'replace')
+
+          repository = fetch('https://dl.google.com/android/repository/repository2-3.xml')
+          images_xml = fetch('https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml')
+
+          emulator_candidates = [(int(build), name) for name, build in re.findall(
+              r'<url>(emulator-darwin_x64-(\d+)\.zip)</url>', repository)]
+          if not emulator_candidates:
+              raise SystemExit('No official Intel macOS emulator archive found.')
+          _, emulator_name = max(emulator_candidates)
+
+          image_candidates = [(int(api), int(revision), name) for name, api, revision in re.findall(
+              r'<url>(x86_64-(\d+)_r(\d+)\.zip)</url>', images_xml)]
+          compatible = [item for item in image_candidates if 31 <= item[0] <= 35]
+          if not compatible:
+              raise SystemExit('No compatible Google APIs x86_64 image found.')
+          api, _, image_name = max(compatible)
+
+          values = {
+              'ANDROID_API': str(api),
+              'EMULATOR_URL': 'https://dl.google.com/android/repository/' + emulator_name,
+              'PLATFORM_TOOLS_URL': 'https://dl.google.com/android/repository/platform-tools-latest-darwin.zip',
+              'SYSTEM_IMAGE_URL': 'https://dl.google.com/android/repository/sys-img/google_apis/' + image_name,
+          }
+          Path('/tmp/runtime/runtime.env').write_text(
+              ''.join(f'{key}={value}\n' for key, value in values.items()))
+          print(values)
+          PY
+          source /tmp/runtime/runtime.env
+          cat /tmp/runtime/runtime.env | tee artifacts/runtime-urls.txt
+
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 900 \
+            "$EMULATOR_URL" -o /tmp/runtime/emulator.zip
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$PLATFORM_TOOLS_URL" -o /tmp/runtime/platform-tools.zip
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 1200 \
+            "$SYSTEM_IMAGE_URL" -o /tmp/runtime/system-image.zip
+
+          for archive in /tmp/runtime/*.zip; do
+            test "$(head -c 2 "$archive")" = 'PK'
+            unzip -tq "$archive" >/dev/null
+          done
+          shasum -a 256 /tmp/runtime/*.zip | tee artifacts/runtime-sha256.txt
+          du -h /tmp/runtime/*.zip | tee artifacts/runtime-sizes.txt
+
+          unzip -q /tmp/runtime/emulator.zip -d "$ANDROID_SDK_ROOT"
+          unzip -q /tmp/runtime/platform-tools.zip -d "$ANDROID_SDK_ROOT"
+          IMAGE_PARENT="$ANDROID_SDK_ROOT/system-images/android-$ANDROID_API/google_apis"
+          mkdir -p "$IMAGE_PARENT"
+          unzip -q /tmp/runtime/system-image.zip -d "$IMAGE_PARENT"
+          IMAGE_FILE=$(find "$IMAGE_PARENT" -type f -name system.img -print -quit)
+          test -n "$IMAGE_FILE"
+          IMAGE_DIR=$(dirname "$IMAGE_FILE")
+          printf 'ANDROID_SDK_ROOT=%s\nANDROID_API=%s\nIMAGE_DIR=%s\n' \
+            "$ANDROID_SDK_ROOT" "$ANDROID_API" "$IMAGE_DIR" \
+            | tee /tmp/runtime/paths.env artifacts/runtime-paths.txt
+          chmod +x "$ANDROID_SDK_ROOT/emulator/emulator" "$ANDROID_SDK_ROOT/platform-tools/adb"
+
+      - name: Download and validate Evermore XAPK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          COOKIE=/tmp/runtime/apkcombo-cookies.txt
+          XAPK=/tmp/runtime/Evermore.xapk
+
+          curl --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 \
+            -A "$UA" -c "$COOKIE" -b "$COOKIE" "$APKCOMBO_PAGE" \
+            -o artifacts/apkcombo-page.html || true
+
+          python3 - <<'PY'
+          import html
+          import re
+          from pathlib import Path
+          page = Path('artifacts/apkcombo-page.html')
+          text = page.read_text(errors='replace') if page.exists() else ''
+          links = []
+          for value in re.findall(r'href=["\']([^"\']+)["\']', text):
+              value = html.unescape(value)
+              if value.startswith('/d?u='):
+                  value = 'https://apkcombo.com' + value
+              if value.startswith('https://apkcombo.com/d?u=') and value not in links:
+                  links.append(value)
+          Path('/tmp/runtime/apkcombo-links.txt').write_text('\n'.join(links) + ('\n' if links else ''))
+          print(f'candidate_links={len(links)}')
+          for link in links:
+              print(link)
+          PY
+          cp /tmp/runtime/apkcombo-links.txt artifacts/apkcombo-links.txt
+
+          downloaded=no
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            rm -f "$XAPK"
+            if curl --fail --location --retry 3 --retry-all-errors \
+              --connect-timeout 30 --max-time 1800 -A "$UA" \
+              -e "$APKCOMBO_PAGE" -c "$COOKIE" -b "$COOKIE" \
+              "$candidate" -o "$XAPK"; then
+              if [ "$(head -c 2 "$XAPK")" = 'PK' ] && unzip -tq "$XAPK" >/dev/null 2>&1; then
+                downloaded=yes
+                echo "source=$candidate" | tee artifacts/xapk-source.txt
+                break
+              fi
+            fi
+          done < /tmp/runtime/apkcombo-links.txt
+
+          if [ "$downloaded" != yes ]; then
+            rm -f "$XAPK"
+            curl --fail --location --retry 6 --retry-all-errors \
+              --connect-timeout 30 --max-time 2400 -A "$UA" -e "$APKCOMBO_PAGE" \
+              "$KNOWN_XAPK_URL" -o "$XAPK"
+            test "$(head -c 2 "$XAPK")" = 'PK'
+            unzip -tq "$XAPK" >/dev/null
+            echo "source=$KNOWN_XAPK_URL" | tee artifacts/xapk-source.txt
+          fi
+
+          ls -lh "$XAPK" | tee artifacts/xapk-size.txt
+          shasum -a 256 "$XAPK" | tee artifacts/xapk-sha256.txt
+          unzip -q "$XAPK" -d /tmp/evermore-unpacked
+          find /tmp/evermore-unpacked -type f -print | sort | tee artifacts/xapk-files.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          apks = sorted(Path('/tmp/evermore-unpacked').rglob('*.apk'))
+          if not apks:
+              raise SystemExit('The XAPK contained no APK files.')
+          Path('/tmp/runtime/apk-list.txt').write_text('\n'.join(str(path) for path in apks) + '\n')
+          print(f'apk_count={len(apks)}')
+          for path in apks:
+              print(path, path.stat().st_size)
+          PY
+          cp /tmp/runtime/apk-list.txt artifacts/apk-list.txt
+
+      - name: Boot Android and install the XAPK splits
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/runtime/paths.env
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          AVD="$HOME/.android/avd/evermore.avd"
+          mkdir -p "$AVD"
+          cat > "$HOME/.android/avd/evermore.ini" <<EOF
+          avd.ini.encoding=UTF-8
+          path=$AVD
+          path.rel=avd/evermore.avd
+          target=android-$ANDROID_API
+          EOF
+          cat > "$AVD/config.ini" <<EOF
+          AvdId=evermore
+          PlayStore.enabled=false
+          abi.type=x86_64
+          avd.ini.displayname=Evermore Intel XAPK
+          avd.ini.encoding=UTF-8
+          disk.dataPartition.size=12G
+          fastboot.forceColdBoot=yes
+          fastboot.forceFastBoot=no
+          hw.accelerometer=yes
+          hw.audioInput=no
+          hw.battery=yes
+          hw.camera.back=none
+          hw.camera.front=none
+          hw.cpu.arch=x86_64
+          hw.cpu.ncore=4
+          hw.gps=yes
+          hw.gpu.enabled=yes
+          hw.gpu.mode=auto
+          hw.keyboard=yes
+          hw.lcd.density=420
+          hw.lcd.height=2400
+          hw.lcd.width=1080
+          hw.mainKeys=no
+          hw.ramSize=6144
+          image.sysdir.1=$IMAGE_DIR/
+          runtime.network.latency=none
+          runtime.network.speed=full
+          sdcard.size=1024M
+          showDeviceFrame=no
+          skin.dynamic=yes
+          skin.name=1080x2400
+          skin.path=_no_skin
+          tag.display=Google APIs
+          tag.id=google_apis
+          vm.heapSize=768
+          EOF
+
+          "$ANDROID_SDK_ROOT/emulator/emulator" -version | tee artifacts/emulator-version.txt
+          nohup "$ANDROID_SDK_ROOT/emulator/emulator" @evermore \
+            -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim \
+            -camera-back none -camera-front none -memory 6144 -cores 4 \
+            -netdelay none -netspeed full > artifacts/emulator.log 2>&1 &
+          echo $! | tee artifacts/emulator.pid
+
+          adb_ready=no
+          for i in $(seq 1 240); do
+            if adb get-state >/dev/null 2>&1; then adb_ready=yes; break; fi
+            sleep 3
+          done
+          test "$adb_ready" = yes
+          booted=no
+          for i in $(seq 1 240); do
+            if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then
+              booted=yes
+              break
+            fi
+            sleep 3
+          done
+          test "$booted" = yes
+          adb shell input keyevent 82 || true
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell settings put global package_verifier_enable 0 || true
+          adb shell settings put global verifier_verify_adb_installs 0 || true
+          adb shell svc wifi enable || true
+          adb shell svc data enable || true
+          adb devices -l | tee artifacts/adb-devices.txt
+          adb shell getprop > artifacts/getprop.txt
+          adb shell getprop ro.product.cpu.abilist | tee artifacts/abilist.txt
+          adb shell getprop ro.dalvik.vm.native.bridge | tee artifacts/native-bridge.txt
+          adb shell wm size | tee artifacts/display-size.txt
+
+          python3 - <<'PY' | tee artifacts/install-result.txt
+          import subprocess
+          from pathlib import Path
+          apks = [line.strip() for line in Path('/tmp/runtime/apk-list.txt').read_text().splitlines() if line.strip()]
+          command = ['adb', 'install-multiple', '-r', '-t', '-g', *apks]
+          print('Installing', len(apks), 'APK files')
+          process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          print(process.stdout)
+          raise SystemExit(process.returncode)
+          PY
+
+          while IFS= read -r obb; do
+            [ -n "$obb" ] || continue
+            adb shell mkdir -p "/sdcard/Android/obb/$PKG"
+            adb push "$obb" "/sdcard/Android/obb/$PKG/"
+          done < <(find /tmp/evermore-unpacked -type f -iname '*.obb' -print)
+
+          adb shell pm path "$PKG" | tee artifacts/package-paths.txt
+          adb shell dumpsys package "$PKG" > artifacts/package.txt
+
+      - name: Launch Evermore and invoke the exact referral URI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/runtime/paths.env
+          export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          snap() {
+            local name="$1"
+            adb exec-out screencap -p > "artifacts/${name}.png" || true
+            adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/window.xml "artifacts/${name}.xml" >/dev/null 2>&1 || true
+          }
+
+          adb logcat -c || true
+          adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 \
+            2>&1 | tee artifacts/first-launch.txt || true
+          sleep 15
+          snap 01-first-launch-15s
+          sleep 30
+          snap 02-first-launch-45s
+
+          adb shell am force-stop "$PKG" || true
+          set +e
+          adb shell am start -W -a android.intent.action.VIEW \
+            -c android.intent.category.BROWSABLE -d "$REFERRAL_URI" -p "$PKG" \
+            2>&1 | tee artifacts/custom-referral-launch.txt
+          custom_rc=${PIPESTATUS[0]}
+          set -e
+          sleep 15
+          snap 03-custom-referral-15s
+          sleep 30
+          snap 04-custom-referral-45s
+
+          set +e
+          adb shell am start -W -a android.intent.action.VIEW \
+            -c android.intent.category.BROWSABLE -d "$REFERRAL_PAGE" -p "$PKG" \
+            2>&1 | tee artifacts/https-referral-launch.txt
+          https_rc=${PIPESTATUS[0]}
+          set -e
+          sleep 15
+          snap 05-https-referral-15s
+
+          adb shell cmd package query-activities -a android.intent.action.VIEW \
+            -c android.intent.category.BROWSABLE -d "$REFERRAL_URI" \
+            > artifacts/custom-referral-handlers.txt 2>&1 || true
+          adb shell dumpsys activity activities > artifacts/activities.txt || true
+          adb shell dumpsys window windows > artifacts/windows.txt || true
+          adb logcat -d -v threadtime > artifacts/logcat.txt || true
+          TOP=$(adb shell dumpsys activity activities | sed -n \
+            's/.*mResumedActivity:.* \([^ ]*\) .*/\1/p' | head -n1 | tr -d '\r')
+          {
+            echo 'installed=yes'
+            echo "package=$PKG"
+            echo "referral_uri=$REFERRAL_URI"
+            echo "custom_uri_rc=$custom_rc"
+            echo "https_uri_rc=$https_rc"
+            echo "top_activity=$TOP"
+            echo "android=$(adb shell getprop ro.build.version.release | tr -d '\r')"
+            echo "sdk=$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+          } | tee artifacts/RESULT.txt
+
+      - name: Publish proof package without marketplace actions
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts
+          SAFE_OS=$(printf '%s' '${{ matrix.os }}' | tr '.:' '--')
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+          root = Path('artifacts')
+          output = Path('/tmp/evermore-direct-xapk-proof.zip')
+          with ZipFile(output, 'w', ZIP_DEFLATED, allowZip64=True) as archive:
+              for path in sorted(root.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(root.parent).as_posix())
+          print(f'proof_size={output.stat().st_size}')
+          PY
+
+          TAG="evermore-direct-xapk-${GITHUB_RUN_ID}-${SAFE_OS}"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          python3 - <<PY > /tmp/release.json
+          import json
+          print(json.dumps({
+              'tag_name': '${TAG}',
+              'target_commitish': '${GITHUB_SHA}',
+              'name': 'Evermore direct XAPK emulator proof ${{ matrix.os }}',
+              'body': 'Direct XAPK installation and referral launch for J32R6Q in an isolated Android emulator.',
+              'draft': True,
+              'prerelease': True,
+          }))
+          PY
+          curl --fail --silent --show-error -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$API/releases" --data-binary @/tmp/release.json \
+            | tee /tmp/release-response.json
+          UPLOAD=$(python3 - <<'PY'
+          import json
+          print(json.load(open('/tmp/release-response.json'))['upload_url'].split('{', 1)[0])
+          PY
+          )
+          curl --fail --silent --show-error -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Content-Type: application/zip' \
+            --data-binary @/tmp/evermore-direct-xapk-proof.zip \
+            "${UPLOAD}?name=evermore-direct-xapk-proof-${SAFE_OS}.zip" \
+            | tee /tmp/asset-response.json
+          python3 - <<'PY'
+          import json
+          data = json.load(open('/tmp/asset-response.json'))
+          print('asset_id=' + str(data['id']))
+          print('asset_size=' + str(data['size']))
+          print('browser_download_url=' + data['browser_download_url'])
+          PY
