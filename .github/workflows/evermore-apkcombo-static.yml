@@ -1,0 +1,39 @@
+name: Evermore APKCombo static probe
+
+on:
+  push:
+    branches:
+      - evermore-apkcombo-static-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DIRECT_URL: https://ztp-pew.apkcombo.com/xapk/com.evermoregames.evermorearcade/15c2243bf1a64f66ab786783b298256a/download?name=com.evermoregames.evermorearcade_0.1.64.xapk
+      PAGE_URL: https://apkcombo.com/evermore-arcade-win-cash/com.evermoregames.evermorearcade/download/apk
+    steps:
+      - name: Probe static XAPK storage
+        shell: bash
+        run: |
+          set -u
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36'
+          echo '=== DNS ==='
+          getent hosts ztp-pew.apkcombo.com || true
+          echo '=== HEAD direct ==='
+          curl -sSIL --connect-timeout 20 --max-time 90 \
+            -A "$UA" -e "$PAGE_URL" "$DIRECT_URL" || true
+          echo '=== RANGE direct ==='
+          rm -f /tmp/probe.bin /tmp/headers.txt
+          curl -sS --location --connect-timeout 20 --max-time 180 \
+            --range 0-65535 -A "$UA" -e "$PAGE_URL" \
+            -D /tmp/headers.txt "$DIRECT_URL" -o /tmp/probe.bin || true
+          cat /tmp/headers.txt 2>/dev/null || true
+          ls -l /tmp/probe.bin 2>/dev/null || true
+          file /tmp/probe.bin 2>/dev/null || true
+          head -c 64 /tmp/probe.bin 2>/dev/null | xxd || true
+          test -f /tmp/probe.bin && test "$(head -c 2 /tmp/probe.bin)" = PK
