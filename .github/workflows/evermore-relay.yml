@@ -1,4 +1,4 @@
-name: Evermore APK relay
+name: Evermore APK relay native
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   download-evermore:
@@ -18,26 +18,21 @@ jobs:
       GPLAYDL_NO_BANNER: '1'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
     steps:
-      - name: Install current anonymous Play downloader
+      - name: Download current Evermore base and split APKs
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p payload diagnostics
           python3 -m venv /tmp/gplaydl
-          /tmp/gplaydl/bin/python -m pip install --quiet 'gplaydl==2.1.7'
-          /tmp/gplaydl/bin/gplaydl --help > diagnostics/help.txt
-
-      - name: Resolve and download Evermore APK splits
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p payload diagnostics
+          /tmp/gplaydl/bin/python -m pip install --quiet \
+            'https://github.com/rehmatworks/gplaydl/archive/refs/tags/v2.1.7.zip'
           GP=/tmp/gplaydl/bin/gplaydl
-          success=0
+          "$GP" --help | tee diagnostics/help.txt
 
-          for dispenser in default community; do
+          success=0
+          for dispenser in aurora community; do
             rm -rf "$HOME/.config/gplaydl" payload/*
-            if [ "$dispenser" = default ]; then
+            if [ "$dispenser" = aurora ]; then
               EXTRA=()
             else
               EXTRA=(-d https://dispenser.gplaydl.com/api/auth)
@@ -45,49 +40,96 @@ jobs:
 
             echo "=== dispenser=$dispenser ===" | tee -a diagnostics/attempts.txt
             set +e
-            timeout 150 "$GP" auth --arch arm64 "${EXTRA[@]}" \
-              > "diagnostics/auth-$dispenser.txt" 2>&1
-            auth_rc=$?
-            timeout 150 "$GP" info "$PKG" --arch arm64 "${EXTRA[@]}" \
-              > "diagnostics/info-$dispenser.txt" 2>&1
-            info_rc=$?
-            timeout 480 "$GP" download "$PKG" -o payload -a arm64 "${EXTRA[@]}" \
-              > "diagnostics/download-$dispenser.txt" 2>&1
-            dl_rc=$?
+            timeout 120 "$GP" auth --arch arm64 "${EXTRA[@]}" \
+              2>&1 | tee "diagnostics/auth-$dispenser.txt"
+            auth_rc=${PIPESTATUS[0]}
+            timeout 120 "$GP" info "$PKG" --arch arm64 "${EXTRA[@]}" \
+              2>&1 | tee "diagnostics/info-$dispenser.txt"
+            info_rc=${PIPESTATUS[0]}
+            timeout 480 "$GP" download "$PKG" -o payload -a arm64 \
+              --no-extras "${EXTRA[@]}" \
+              2>&1 | tee "diagnostics/download-$dispenser.txt"
+            dl_rc=${PIPESTATUS[0]}
             set -e
 
-            echo "auth_rc=$auth_rc info_rc=$info_rc download_rc=$dl_rc" \
+            apk_count=$(find payload -type f -iname '*.apk' | wc -l)
+            echo "auth_rc=$auth_rc info_rc=$info_rc download_rc=$dl_rc apk_count=$apk_count" \
               | tee -a diagnostics/attempts.txt
-            find payload -maxdepth 3 -type f -printf '%s %p\n' | sort -n \
+            find payload -maxdepth 2 -type f -printf '%s %p\n' | sort -n \
               | tee "diagnostics/files-$dispenser.txt"
 
-            apk_count=$(find payload -type f -iname '*.apk' | wc -l)
             if [ "$dl_rc" -eq 0 ] && [ "$apk_count" -gt 0 ]; then
               success=1
-              echo "$dispenser" > diagnostics/successful-dispenser.txt
+              printf '%s\n' "$dispenser" | tee diagnostics/successful-dispenser.txt
               break
             fi
           done
 
           if [ "$success" -ne 1 ]; then
-            cat diagnostics/auth-*.txt diagnostics/info-*.txt diagnostics/download-*.txt \
-              > diagnostics/combined-errors.txt || true
+            echo 'Evermore APK acquisition failed on both anonymous dispensers.' | tee diagnostics/RESULT.txt
             exit 20
           fi
 
-          find payload -type f -print0 | xargs -0 sha256sum > diagnostics/sha256.txt
-          du -ah payload | sort -h > diagnostics/sizes.txt
+          find payload -type f -print0 | xargs -0 sha256sum | tee diagnostics/sha256.txt
+          du -ah payload | sort -h | tee diagnostics/sizes.txt
           printf 'package=%s\napk_count=%s\n' "$PKG" \
-            "$(find payload -type f -iname '*.apk' | wc -l)" > diagnostics/RESULT.txt
+            "$(find payload -type f -iname '*.apk' | wc -l)" \
+            | tee diagnostics/RESULT.txt
 
-      - name: Upload Evermore package
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: evermore-google-play-arm64
-          path: |
-            payload
-            diagnostics
-          if-no-files-found: warn
-          compression-level: 0
-          retention-days: 3
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_STORED, ZipFile
+          out = Path('/tmp/evermore-google-play-arm64.zip')
+          with ZipFile(out, 'w', compression=ZIP_STORED, allowZip64=True) as z:
+              for root in (Path('payload'), Path('diagnostics')):
+                  for path in sorted(root.rglob('*')):
+                      if path.is_file():
+                          z.write(path, path.as_posix())
+          print(f'archive={out} size={out.stat().st_size}')
+          PY
+
+      - name: Publish staged package without marketplace actions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          TAG="evermore-apk-${GITHUB_RUN_ID}"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          python3 - <<PY > /tmp/release.json
+          import json
+          print(json.dumps({
+              'tag_name': '${TAG}',
+              'target_commitish': '${GITHUB_SHA}',
+              'name': 'Temporary Evermore APK relay ${GITHUB_RUN_ID}',
+              'body': 'Anonymous Google Play delivery for the isolated Evermore emulator test.',
+              'draft': True,
+              'prerelease': True,
+          }))
+          PY
+          curl --fail --silent --show-error -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$API/releases" --data-binary @/tmp/release.json \
+            | tee /tmp/release-response.json
+          UPLOAD=$(python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/release-response.json'))
+          print(data['upload_url'].split('{',1)[0])
+          PY
+          )
+          curl --fail --silent --show-error -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Content-Type: application/zip' \
+            --data-binary @/tmp/evermore-google-play-arm64.zip \
+            "${UPLOAD}?name=evermore-google-play-arm64.zip" \
+            | tee /tmp/asset-response.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/asset-response.json'))
+          print('release_asset_id=' + str(data['id']))
+          print('release_asset_size=' + str(data['size']))
+          print('release_asset_url=' + data['url'])
+          print('browser_download_url=' + data['browser_download_url'])
+          PY
