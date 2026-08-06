@@ -26,10 +26,100 @@ jobs:
         with:
           ref: main
 
-      - name: Pin current QooApp APK
+      - name: Probe direct Evermore package and pin QooApp
         shell: bash
         run: |
-          perl -0pi -e 's#https://d\.qoo-apk\.com/QooApp\.apk#https://d.qoo-apk.com/880/apk/com.qooapp.qoohelper-20260708152301.apk#g' .github/evermore/qooapp-native-run.sh
+          set -Eeuo pipefail
+          mkdir -p /tmp/evermore-direct artifacts
+          PKG='com.evermoregames.evermorearcade'
+          UA='QooApp 9.4.0'
+          found=no
+          urls=(
+            "https://api.qoo-app.com/v1/apps/download?id=$PKG"
+            "https://api.qoo-app.com/v1/apps/download?id=150473"
+            "https://api.qoo-app.com/v6/apps/$PKG/download"
+            "https://d.qoo-apk.com/150473/apk/base.apk"
+            "https://d.qoo-apk.com/150473/apk/$PKG.apk"
+            "https://d.qoo-apk.com/150473/$PKG.apk"
+            "https://d.qoo-apk.com/150473/apk/150473.apk"
+          )
+          for i in "${!urls[@]}"; do
+            url="${urls[$i]}"
+            echo "probe[$i]=$url" | tee -a artifacts/direct-probe.txt
+            rm -f /tmp/evermore-direct/candidate.apk
+            set +e
+            curl --location --fail --retry 2 --retry-all-errors \
+              --connect-timeout 20 --max-time 180 -A "$UA" \
+              -D "artifacts/direct-probe-$i.headers" \
+              "$url" -o /tmp/evermore-direct/candidate.apk
+            rc=$?
+            set -e
+            size=$(stat -f%z /tmp/evermore-direct/candidate.apk 2>/dev/null || echo 0)
+            echo "rc=$rc size=$size" | tee -a artifacts/direct-probe.txt
+            if [ "$rc" -eq 0 ] && [ "$size" -gt 1000000 ] && \
+               [ "$(head -c 2 /tmp/evermore-direct/candidate.apk)" = 'PK' ] && \
+               unzip -tq /tmp/evermore-direct/candidate.apk >/dev/null 2>&1; then
+              mv /tmp/evermore-direct/candidate.apk /tmp/evermore-direct/Evermore.apk
+              printf '%s\n' "$url" | tee artifacts/direct-evermore-source.txt
+              shasum -a 256 /tmp/evermore-direct/Evermore.apk | tee artifacts/direct-evermore-sha256.txt
+              found=yes
+              break
+            fi
+          done
+          echo "direct_package_found=$found" | tee artifacts/direct-evermore-status.txt
+
+          perl -0pi -e 's#https://d\.qoo-apk\.com/QooApp\.apk#https://d.qoo-apk.com/880/apk/com.qooapp.qoohelper-20260708152301.apk#g' \
+            .github/evermore/qooapp-native-run.sh
+
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/evermore/qooapp-native-run.sh')
+          text = path.read_text()
+          marker = "echo '=== Install and launch QooApp ==='"
+          insert = r'''if [ -f /tmp/evermore-direct/Evermore.apk ]; then
+  echo '=== Direct Evermore APK found: install before QooApp fallback ==='
+  set +e
+  adb install -r -t -g /tmp/evermore-direct/Evermore.apk | tee artifacts/direct-evermore-install.txt
+  direct_rc=${PIPESTATUS[0]}
+  set -e
+  if [ "$direct_rc" -eq 0 ] && installed; then
+    echo 'direct_install=yes' | tee artifacts/direct-install-status.txt
+    adb shell pm path "$EVERMORE_PKG" | tee artifacts/evermore-package-paths.txt
+    adb logcat -c || true
+    adb shell monkey -p "$EVERMORE_PKG" -c android.intent.category.LAUNCHER 1 | tee artifacts/evermore-first-launch.txt || true
+    sleep 20
+    snap 00-direct-evermore-first-launch
+    adb shell am force-stop "$EVERMORE_PKG" || true
+    adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE \
+      -d "$REFERRAL_URI" -p "$EVERMORE_PKG" | tee artifacts/referral-custom.txt || true
+    sleep 12
+    snap 00-direct-referral-custom-12s
+    sleep 20
+    snap 00-direct-referral-custom-32s
+    adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE \
+      -d "$REFERRAL_URI" > artifacts/referral-custom-handlers.txt 2>&1 || true
+    adb shell dumpsys activity activities > artifacts/activities.txt || true
+    adb logcat -d -v threadtime > artifacts/logcat.txt || true
+    TOP=$(adb shell dumpsys activity activities | sed -n 's/.*mResumedActivity:.* \([^ ]*\) .*/\1/p' | head -n1 | tr -d '\r')
+    {
+      echo 'evermore_installed=yes'
+      echo 'acquisition=direct_qooapp_api'
+      echo "top_activity=$TOP"
+      echo "referral_uri=$REFERRAL_URI"
+      echo "android=$(adb shell getprop ro.build.version.release | tr -d '\r')"
+      echo "sdk=$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+      echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+      echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+    } | tee artifacts/RESULT.txt
+    exit 0
+  fi
+  echo "direct_install=no rc=$direct_rc" | tee artifacts/direct-install-status.txt
+fi
+'''
+          if marker not in text:
+              raise SystemExit('controller marker missing')
+          path.write_text(text.replace(marker, insert + '\n' + marker, 1))
+          PY
 
       - name: Run QooApp Android emulator controller
         shell: bash
