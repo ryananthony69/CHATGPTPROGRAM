@@ -1,4 +1,4 @@
-name: Evermore referral Android emulator macOS
+name: Evermore referral Android emulator Apple Silicon
 
 on:
   push:
@@ -9,9 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: evermore-macos-native-arm64
+  cancel-in-progress: true
+
 jobs:
   open-referral:
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       AURORA_PKG: com.aurora.store
@@ -20,16 +24,18 @@ jobs:
       AURORA_APK_URL: https://f-droid.org/repo/com.aurora.store_75.apk
 
     steps:
-      - name: Check out the proven controller source
+      - name: Check out the corrected controller source
         uses: actions/checkout@v4
         with:
           ref: evermore-aurora-v2-20260806
 
-      - name: Prepare Aurora and controller on macOS
+      - name: Prepare Aurora and controller on Apple Silicon
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p artifacts /tmp/aurora
+          uname -a | tee artifacts/host.txt
+          uname -m | tee -a artifacts/host.txt
 
           curl --location --retry 4 --retry-all-errors --connect-timeout 30 --max-time 120 \
             "$REFERRAL_URL" -o artifacts/referral-page.html || true
@@ -55,34 +61,38 @@ jobs:
           PY
           bash /tmp/build-controller.sh
 
-          if [ ! -x /usr/local/bin/bash ]; then
+          BREW_BASH="$(brew --prefix)/bin/bash"
+          if [ ! -x "$BREW_BASH" ]; then
             brew install bash
           fi
-          /usr/local/bin/bash --version | head -n 1 | tee artifacts/bash-version.txt
-          /usr/local/bin/bash -n /tmp/run-evermore.sh
+          BREW_BASH="$(brew --prefix)/bin/bash"
+          "$BREW_BASH" --version | head -n 1 | tee artifacts/bash-version.txt
+          "$BREW_BASH" -n /tmp/run-evermore.sh
           python3 -m py_compile /tmp/ui_driver.py
+          printf '#!%s\nexec %q /tmp/run-evermore.sh\n' "$BREW_BASH" "$BREW_BASH" > /tmp/start-evermore
+          chmod +x /tmp/start-evermore
 
-      - name: Boot Android on macOS, install Evermore, and open referral
+      - name: Boot native ARM64 Android, install Evermore, and open referral
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           target: google_apis
-          arch: x86_64
+          arch: arm64-v8a
           profile: pixel_6
-          cores: 4
-          ram-size: 6144M
-          heap-size: 768M
-          disk-size: 16384M
+          cores: 3
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 12288M
           emulator-boot-timeout: 1200
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
-          script: /usr/local/bin/bash /tmp/run-evermore.sh
+          script: /tmp/start-evermore
 
       - name: Upload screenshots and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evermore-macos-proof
+          name: evermore-apple-silicon-proof
           path: artifacts
           if-no-files-found: warn
           retention-days: 3
