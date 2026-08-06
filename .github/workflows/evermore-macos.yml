@@ -1,0 +1,88 @@
+name: Evermore referral Android emulator macOS
+
+on:
+  push:
+    branches:
+      - evermore-macos-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  open-referral:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      AURORA_PKG: com.aurora.store
+      EVERMORE_PKG: com.evermoregames.evermorearcade
+      REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
+      AURORA_APK_URL: https://f-droid.org/repo/com.aurora.store_75.apk
+
+    steps:
+      - name: Check out the proven controller source
+        uses: actions/checkout@v4
+        with:
+          ref: evermore-aurora-v2-20260806
+
+      - name: Prepare Aurora and controller on macOS
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/aurora
+
+          curl --location --retry 4 --retry-all-errors --connect-timeout 30 --max-time 120 \
+            "$REFERRAL_URL" -o artifacts/referral-page.html || true
+
+          curl --fail --location --retry 6 --retry-all-errors \
+            --connect-timeout 30 --max-time 600 \
+            "$AURORA_APK_URL" -o /tmp/aurora/AuroraStore.apk
+          test "$(head -c 2 /tmp/aurora/AuroraStore.apk)" = 'PK'
+          unzip -tq /tmp/aurora/AuroraStore.apk >/dev/null
+          ls -lh /tmp/aurora/AuroraStore.apk | tee artifacts/aurora-download.txt
+          shasum -a 256 /tmp/aurora/AuroraStore.apk | tee -a artifacts/aurora-download.txt
+
+          python3 -m pip install --disable-pip-version-check --quiet PyYAML
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          source = Path('.github/workflows/evermore-aurora-v2.yml')
+          workflow = yaml.safe_load(source.read_text())
+          steps = workflow['jobs']['open-referral']['steps']
+          controller = next(step['run'] for step in steps if step.get('name') == 'Write emulator controller')
+          Path('/tmp/build-controller.sh').write_text(controller)
+          PY
+          bash /tmp/build-controller.sh
+
+          if [ ! -x /usr/local/bin/bash ]; then
+            brew install bash
+          fi
+          /usr/local/bin/bash --version | head -n 1 | tee artifacts/bash-version.txt
+          /usr/local/bin/bash -n /tmp/run-evermore.sh
+          python3 -m py_compile /tmp/ui_driver.py
+
+      - name: Boot Android on macOS, install Evermore, and open referral
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 6144M
+          heap-size: 768M
+          disk-size: 16384M
+          emulator-boot-timeout: 1200
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: /usr/local/bin/bash /tmp/run-evermore.sh
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-macos-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
