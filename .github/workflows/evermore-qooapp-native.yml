@@ -26,6 +26,11 @@ jobs:
         with:
           ref: main
 
+      - name: Pin current QooApp APK
+        shell: bash
+        run: |
+          perl -0pi -e 's#https://d\.qoo-apk\.com/QooApp\.apk#https://d.qoo-apk.com/880/apk/com.qooapp.qoohelper-20260708152301.apk#g' .github/evermore/qooapp-native-run.sh
+
       - name: Run QooApp Android emulator controller
         shell: bash
         run: bash .github/evermore/qooapp-native-run.sh
