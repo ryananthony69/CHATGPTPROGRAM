@@ -1,0 +1,93 @@
+name: Evermore APK relay
+
+on:
+  push:
+    branches:
+      - evermore-relay-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download-evermore:
+    runs-on: ubuntu-slim
+    timeout-minutes: 14
+    env:
+      PKG: com.evermoregames.evermorearcade
+      GPLAYDL_NO_BANNER: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Install current anonymous Play downloader
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p payload diagnostics
+          python3 -m venv /tmp/gplaydl
+          /tmp/gplaydl/bin/python -m pip install --quiet 'gplaydl==2.1.7'
+          /tmp/gplaydl/bin/gplaydl --help > diagnostics/help.txt
+
+      - name: Resolve and download Evermore APK splits
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p payload diagnostics
+          GP=/tmp/gplaydl/bin/gplaydl
+          success=0
+
+          for dispenser in default community; do
+            rm -rf "$HOME/.config/gplaydl" payload/*
+            if [ "$dispenser" = default ]; then
+              EXTRA=()
+            else
+              EXTRA=(-d https://dispenser.gplaydl.com/api/auth)
+            fi
+
+            echo "=== dispenser=$dispenser ===" | tee -a diagnostics/attempts.txt
+            set +e
+            timeout 150 "$GP" auth --arch arm64 "${EXTRA[@]}" \
+              > "diagnostics/auth-$dispenser.txt" 2>&1
+            auth_rc=$?
+            timeout 150 "$GP" info "$PKG" --arch arm64 "${EXTRA[@]}" \
+              > "diagnostics/info-$dispenser.txt" 2>&1
+            info_rc=$?
+            timeout 480 "$GP" download "$PKG" -o payload -a arm64 "${EXTRA[@]}" \
+              > "diagnostics/download-$dispenser.txt" 2>&1
+            dl_rc=$?
+            set -e
+
+            echo "auth_rc=$auth_rc info_rc=$info_rc download_rc=$dl_rc" \
+              | tee -a diagnostics/attempts.txt
+            find payload -maxdepth 3 -type f -printf '%s %p\n' | sort -n \
+              | tee "diagnostics/files-$dispenser.txt"
+
+            apk_count=$(find payload -type f -iname '*.apk' | wc -l)
+            if [ "$dl_rc" -eq 0 ] && [ "$apk_count" -gt 0 ]; then
+              success=1
+              echo "$dispenser" > diagnostics/successful-dispenser.txt
+              break
+            fi
+          done
+
+          if [ "$success" -ne 1 ]; then
+            cat diagnostics/auth-*.txt diagnostics/info-*.txt diagnostics/download-*.txt \
+              > diagnostics/combined-errors.txt || true
+            exit 20
+          fi
+
+          find payload -type f -print0 | xargs -0 sha256sum > diagnostics/sha256.txt
+          du -ah payload | sort -h > diagnostics/sizes.txt
+          printf 'package=%s\napk_count=%s\n' "$PKG" \
+            "$(find payload -type f -iname '*.apk' | wc -l)" > diagnostics/RESULT.txt
+
+      - name: Upload Evermore package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-google-play-arm64
+          path: |
+            payload
+            diagnostics
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 3
