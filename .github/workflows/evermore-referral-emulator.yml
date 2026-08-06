@@ -1,0 +1,208 @@
+name: Evermore referral Android emulator
+
+on:
+  push:
+    branches:
+      - evermore-emulator-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  open-referral:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      PKG: com.evermoregames.evermorearcade
+      REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
+      APKCOMBO_PAGE: https://apkcombo.com/evermore-arcade-win-cash/com.evermoregames.evermorearcade/download/apk
+      FALLBACK_REDIRECT: https://apkcombo.com/d?u=aHR0cHM6Ly96dHAtcGV3LmFwa2NvbWJvLmNvbS94YXBrL2NvbS5ldmVybW9yZWdhbWVzLmV2ZXJtb3JlYXJjYWRlLzE1YzIyNDNiZjFhNjRmNjZhYjc4Njc4M2IyOTgyNTZhL2Rvd25sb2FkP25hbWU9Y29tLmV2ZXJtb3JlZ2FtZXMuZXZlcm1vcmVhcmNhZGVfMC4xLjY0LnhhcGs%3D
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Download an Evermore XAPK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/evermore-download
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36'
+          PAGE_FILE=/tmp/evermore-download/page.html
+          XAPK=/tmp/evermore.xapk
+
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+            --max-time 180 -A "$UA" "$APKCOMBO_PAGE" -o "$PAGE_FILE" || true
+
+          python3 - <<'PY' > /tmp/evermore-download/candidates.txt
+          import html, re
+          from pathlib import Path
+          page = Path('/tmp/evermore-download/page.html')
+          text = page.read_text(errors='ignore') if page.exists() else ''
+          seen = set()
+          for raw in re.findall(r'href=["\']([^"\']+)["\']', text):
+              link = html.unescape(raw)
+              if '/d?u=' not in link:
+                  continue
+              if link.startswith('/'):
+                  link = 'https://apkcombo.com' + link
+              if link not in seen:
+                  seen.add(link)
+                  print(link)
+          PY
+          printf '%s\n' "$FALLBACK_REDIRECT" >> /tmp/evermore-download/candidates.txt
+
+          downloaded=0
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            echo "Trying APK source: $candidate"
+            rm -f "$XAPK"
+            if curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+                --max-time 1200 -A "$UA" -e "$APKCOMBO_PAGE" "$candidate" -o "$XAPK"; then
+              if [ "$(head -c 2 "$XAPK" || true)" = 'PK' ] && unzip -tq "$XAPK" >/dev/null 2>&1; then
+                downloaded=1
+                break
+              fi
+            fi
+          done < /tmp/evermore-download/candidates.txt
+
+          if [ "$downloaded" -ne 1 ]; then
+            echo 'No valid Evermore XAPK could be downloaded.' | tee artifacts/RESULT.txt
+            exit 20
+          fi
+
+          ls -lh "$XAPK" | tee artifacts/download.txt
+          sha256sum "$XAPK" | tee -a artifacts/download.txt
+          unzip -l "$XAPK" | head -n 120 | tee artifacts/xapk-contents.txt
+
+      - name: Write emulator test script
+        shell: bash
+        run: |
+          cat > run-evermore.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/evermore-extracted
+          exec > >(tee artifacts/runner.log) 2>&1
+
+          snapshot() {
+            local name="$1"
+            adb exec-out screencap -p > "artifacts/${name}.png" || true
+            adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/window.xml "artifacts/${name}.xml" >/dev/null 2>&1 || true
+          }
+
+          echo '=== Emulator identity ==='
+          adb wait-for-device
+          adb shell getprop > artifacts/getprop.txt
+          adb shell getprop ro.build.version.release
+          adb shell getprop ro.build.version.sdk
+          adb shell getprop ro.product.cpu.abilist
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell svc wifi enable || true
+          adb shell svc data enable || true
+
+          echo '=== Extracting Evermore package ==='
+          unzip -q /tmp/evermore.xapk -d /tmp/evermore-extracted
+          rm -f /tmp/evermore.xapk
+          find /tmp/evermore-extracted -maxdepth 3 -type f -printf '%s %p\n' | sort -n > artifacts/extracted-files.txt
+
+          mapfile -d '' APKS < <(find /tmp/evermore-extracted -type f -iname '*.apk' -print0)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo 'XAPK contained no APK files.' | tee artifacts/RESULT.txt
+            exit 21
+          fi
+
+          echo "Installing ${#APKS[@]} APK split(s)"
+          adb install-multiple -r -t -g "${APKS[@]}" | tee artifacts/install.txt
+
+          OBB_DIRS=$(find /tmp/evermore-extracted -type f -iname '*.obb' -printf '%h\n' | sort -u || true)
+          if [ -n "$OBB_DIRS" ]; then
+            adb shell mkdir -p "/sdcard/Android/obb/$PKG"
+            while IFS= read -r dir; do
+              [ -n "$dir" ] || continue
+              find "$dir" -maxdepth 1 -type f -iname '*.obb' -print0 | while IFS= read -r -d '' obb; do
+                adb push "$obb" "/sdcard/Android/obb/$PKG/"
+              done
+            done <<< "$OBB_DIRS"
+          fi
+
+          echo '=== Package verification ==='
+          adb shell pm path "$PKG" | tee artifacts/package-paths.txt
+          adb shell dumpsys package "$PKG" > artifacts/package-dump.txt
+          adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_URL" > artifacts/deep-link-handlers-before.txt 2>&1 || true
+
+          echo '=== First launch ==='
+          adb logcat -c || true
+          adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 | tee artifacts/first-launch.txt || true
+          sleep 12
+          snapshot 01-first-launch
+
+          echo '=== Opening referral as an app-scoped deep link ==='
+          adb shell am force-stop "$PKG" || true
+          adb shell am start -W -a android.intent.action.VIEW \
+            -c android.intent.category.BROWSABLE \
+            -d "$REFERRAL_URL" -p "$PKG" | tee artifacts/deep-link-app-scoped.txt || true
+          sleep 8
+          snapshot 02-referral-8s
+          sleep 12
+          snapshot 03-referral-20s
+
+          echo '=== Opening referral through Android resolver as fallback ==='
+          adb shell am start -W -a android.intent.action.VIEW \
+            -c android.intent.category.BROWSABLE \
+            -d "$REFERRAL_URL" | tee artifacts/deep-link-generic.txt || true
+          sleep 10
+          snapshot 04-referral-generic
+
+          adb shell dumpsys activity activities > artifacts/activities.txt || true
+          adb shell dumpsys window windows > artifacts/windows.txt || true
+          adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_URL" > artifacts/deep-link-handlers-after.txt 2>&1 || true
+          adb logcat -d -v threadtime > artifacts/logcat.txt || true
+
+          TOP=$(adb shell dumpsys activity activities | sed -n 's/.*mResumedActivity:.* \([^ ]*\) .*/\1/p' | head -n1 | tr -d '\r')
+          {
+            echo "package=$PKG"
+            echo "referral=$REFERRAL_URL"
+            echo "installed=yes"
+            echo "top_activity=$TOP"
+            echo "android=$(adb shell getprop ro.build.version.release | tr -d '\r')"
+            echo "sdk=$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+          } | tee artifacts/RESULT.txt
+          SH
+          chmod +x run-evermore.sh
+
+      - name: Boot Android 12, install Evermore, and open referral
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 31
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 8192M
+          emulator-boot-timeout: 900
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash run-evermore.sh
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-referral-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
