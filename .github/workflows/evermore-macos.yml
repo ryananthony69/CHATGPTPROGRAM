@@ -1,4 +1,4 @@
-name: Evermore referral Android emulator Apple Silicon
+name: Evermore referral Android emulator macOS Intel
 
 on:
   push:
@@ -10,17 +10,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: evermore-macos-native-arm64
+  group: evermore-macos-intel-corrected
   cancel-in-progress: true
 
 jobs:
   open-referral:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 60
     env:
       AURORA_PKG: com.aurora.store
       EVERMORE_PKG: com.evermoregames.evermorearcade
       REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
+      CUSTOM_REFERRAL_URI: evermorearcade://referral?code=J32R6Q
       AURORA_APK_URL: https://f-droid.org/repo/com.aurora.store_75.apk
 
     steps:
@@ -29,7 +30,7 @@ jobs:
         with:
           ref: evermore-aurora-v2-20260806
 
-      - name: Prepare Aurora and controller on Apple Silicon
+      - name: Prepare Aurora and corrected controller
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -48,8 +49,10 @@ jobs:
           ls -lh /tmp/aurora/AuroraStore.apk | tee artifacts/aurora-download.txt
           shasum -a 256 /tmp/aurora/AuroraStore.apk | tee -a artifacts/aurora-download.txt
 
-          python3 -m pip install --disable-pip-version-check --quiet PyYAML
-          python3 - <<'PY'
+          python3 -m venv /tmp/controller-python
+          /tmp/controller-python/bin/python -m pip install \
+            --disable-pip-version-check --quiet PyYAML
+          /tmp/controller-python/bin/python - <<'PY'
           from pathlib import Path
           import yaml
 
@@ -61,6 +64,25 @@ jobs:
           PY
           bash /tmp/build-controller.sh
 
+          cat >> /tmp/run-evermore.sh <<'SH'
+
+          echo '=== Open exact Evermore custom referral URI ==='
+          if adb shell pm path "$EVERMORE_PKG" 2>/dev/null | grep -q '^package:'; then
+            adb shell am force-stop "$EVERMORE_PKG" || true
+            adb shell am start -W -a android.intent.action.VIEW \
+              -c android.intent.category.BROWSABLE \
+              -d "$CUSTOM_REFERRAL_URI" -p "$EVERMORE_PKG" \
+              | tee artifacts/custom-referral-launch.txt || true
+            sleep 15
+            adb exec-out screencap -p > artifacts/09-custom-referral-15s.png || true
+            adb shell uiautomator dump /sdcard/custom-referral.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/custom-referral.xml artifacts/09-custom-referral-15s.xml >/dev/null 2>&1 || true
+            sleep 30
+            adb exec-out screencap -p > artifacts/10-custom-referral-45s.png || true
+            adb shell dumpsys activity activities > artifacts/custom-referral-activities.txt || true
+          fi
+          SH
+
           BREW_BASH="$(brew --prefix)/bin/bash"
           if [ ! -x "$BREW_BASH" ]; then
             brew install bash
@@ -68,21 +90,21 @@ jobs:
           BREW_BASH="$(brew --prefix)/bin/bash"
           "$BREW_BASH" --version | head -n 1 | tee artifacts/bash-version.txt
           "$BREW_BASH" -n /tmp/run-evermore.sh
-          python3 -m py_compile /tmp/ui_driver.py
+          /tmp/controller-python/bin/python -m py_compile /tmp/ui_driver.py
           printf '#!%s\nexec %q /tmp/run-evermore.sh\n' "$BREW_BASH" "$BREW_BASH" > /tmp/start-evermore
           chmod +x /tmp/start-evermore
 
-      - name: Boot native ARM64 Android, install Evermore, and open referral
+      - name: Boot x86 Android, install Evermore, and open referral
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           target: google_apis
-          arch: arm64-v8a
+          arch: x86_64
           profile: pixel_6
-          cores: 3
-          ram-size: 4096M
-          heap-size: 512M
-          disk-size: 12288M
+          cores: 4
+          ram-size: 6144M
+          heap-size: 768M
+          disk-size: 16384M
           emulator-boot-timeout: 1200
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
@@ -92,7 +114,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evermore-apple-silicon-proof
+          name: evermore-macos-intel-proof
           path: artifacts
           if-no-files-found: warn
           retention-days: 3
