@@ -1,0 +1,38 @@
+name: Evermore QooApp native emulator
+
+on:
+  workflow_run:
+    workflows:
+      - Evermore direct XAPK Android emulator
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evermore-qooapp-native
+  cancel-in-progress: true
+
+jobs:
+  open-referral:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out controller
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Run QooApp Android emulator controller
+        shell: bash
+        run: bash .github/evermore/qooapp-native-run.sh
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-qooapp-native-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
