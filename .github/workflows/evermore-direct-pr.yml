@@ -1,6 +1,9 @@
 name: Evermore direct PR emulator
 
 on:
+  workflow_run:
+    workflows: ["Evermore source probe"]
+    types: [completed]
   push:
     branches: [main]
     paths:
@@ -19,7 +22,7 @@ concurrency:
 
 jobs:
   open-referral:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.title || '', 'Evermore direct XAPK')
+    if: github.event_name == 'workflow_run' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.title || '', 'Evermore direct XAPK')
     runs-on: ubuntu-latest
     timeout-minutes: 55
     env:
@@ -32,6 +35,8 @@ jobs:
     steps:
       - name: Check out direct installer scripts
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Enable KVM and prepare XAPK
         shell: bash
