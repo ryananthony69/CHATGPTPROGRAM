@@ -1,0 +1,58 @@
+name: Evermore direct PR emulator
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evermore-direct-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  open-referral:
+    if: contains(github.event.pull_request.title || 'manual', 'Evermore direct XAPK')
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      PKG: com.evermoregames.evermorearcade
+      REFERRAL_URI: evermorearcade://referral?code=J32R6Q
+      REFERRAL_PAGE: https://evermoregamesllc.com/referral?code=J32R6Q
+      APKCOMBO_PAGE: https://apkcombo.com/evermore-arcade-win-cash/com.evermoregames.evermorearcade/download/apk
+      XAPK_URL: https://ztp-pew.apkcombo.com/xapk/com.evermoregames.evermorearcade/15c2243bf1a64f66ab786783b298256a/download?name=com.evermoregames.evermorearcade_0.1.64.xapk
+
+    steps:
+      - name: Check out direct installer scripts
+        uses: actions/checkout@v4
+
+      - name: Enable KVM and prepare XAPK
+        shell: bash
+        run: bash .github/evermore/prepare.sh
+
+      - name: Boot Android, install XAPK, and open referral
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 6144M
+          heap-size: 768M
+          disk-size: 16384M
+          emulator-boot-timeout: 1200
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash .github/evermore/run.sh
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-direct-pr-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
