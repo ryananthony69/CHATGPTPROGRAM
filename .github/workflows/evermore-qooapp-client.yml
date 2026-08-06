@@ -1,0 +1,346 @@
+name: Evermore QooApp client emulator
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/evermore-qooapp-client.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: evermore-qooapp-client
+  cancel-in-progress: true
+
+jobs:
+  open-referral:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      EVERMORE_PKG: com.evermoregames.evermorearcade
+      QOOAPP_PKG: com.qooapp.qoohelper
+      QOOAPP_APK_URL: https://d.qoo-apk.com/QooApp.apk
+      QOOAPP_APP_ID: '150473'
+      REFERRAL_URI: evermorearcade://referral?code=J32R6Q
+      REFERRAL_PAGE: https://evermoregamesllc.com/referral?code=J32R6Q
+
+    steps:
+      - name: Download QooApp and Android runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/runtime
+          export ANDROID_SDK_ROOT="$RUNNER_TEMP/android-sdk"
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          mkdir -p "$ANDROID_SDK_ROOT"
+          printf 'macos=%s\narch=%s\n' "$(sw_vers -productVersion)" "$(uname -m)" | tee artifacts/host.txt
+          test "$(uname -m)" = x86_64
+
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$QOOAPP_APK_URL" -o /tmp/runtime/QooApp.apk
+          test "$(head -c 2 /tmp/runtime/QooApp.apk)" = 'PK'
+          unzip -tq /tmp/runtime/QooApp.apk >/dev/null
+          shasum -a 256 /tmp/runtime/QooApp.apk | tee artifacts/qooapp-sha256.txt
+          ls -lh /tmp/runtime/QooApp.apk | tee artifacts/qooapp-size.txt
+
+          python3 - <<'PY'
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          def fetch(url):
+              request = urllib.request.Request(url, headers={'User-Agent': 'AndroidSDKManager/1.0'})
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  return response.read().decode('utf-8', 'replace')
+
+          repository = fetch('https://dl.google.com/android/repository/repository2-3.xml')
+          images_xml = fetch('https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-3.xml')
+          emulator_candidates = [(int(build), name) for name, build in re.findall(
+              r'<url>(emulator-darwin_x64-(\d+)\.zip)</url>', repository)]
+          image_candidates = [(int(api), int(revision), name) for name, api, revision in re.findall(
+              r'<url>(x86_64-(\d+)_r(\d+)\.zip)</url>', images_xml)]
+          if not emulator_candidates:
+              raise SystemExit('No Intel emulator archive found')
+          compatible = [item for item in image_candidates if 31 <= item[0] <= 35]
+          if not compatible:
+              raise SystemExit('No compatible x86_64 Google APIs image found')
+          _, emulator_name = max(emulator_candidates)
+          api, _, image_name = max(compatible)
+          values = {
+              'ANDROID_API': str(api),
+              'EMULATOR_URL': 'https://dl.google.com/android/repository/' + emulator_name,
+              'PLATFORM_TOOLS_URL': 'https://dl.google.com/android/repository/platform-tools-latest-darwin.zip',
+              'SYSTEM_IMAGE_URL': 'https://dl.google.com/android/repository/sys-img/google_apis/' + image_name,
+          }
+          Path('/tmp/runtime/runtime.env').write_text(''.join(f'{k}={v}\n' for k,v in values.items()))
+          print(values)
+          PY
+          source /tmp/runtime/runtime.env
+          cat /tmp/runtime/runtime.env | tee artifacts/runtime-urls.txt
+
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 900 \
+            "$EMULATOR_URL" -o /tmp/runtime/emulator.zip
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$PLATFORM_TOOLS_URL" -o /tmp/runtime/platform-tools.zip
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 1200 \
+            "$SYSTEM_IMAGE_URL" -o /tmp/runtime/system-image.zip
+          for archive in /tmp/runtime/*.zip; do
+            test "$(head -c 2 "$archive")" = 'PK'
+            unzip -tq "$archive" >/dev/null
+          done
+
+          unzip -q /tmp/runtime/emulator.zip -d "$ANDROID_SDK_ROOT"
+          unzip -q /tmp/runtime/platform-tools.zip -d "$ANDROID_SDK_ROOT"
+          IMAGE_PARENT="$ANDROID_SDK_ROOT/system-images/android-$ANDROID_API/google_apis"
+          mkdir -p "$IMAGE_PARENT"
+          unzip -q /tmp/runtime/system-image.zip -d "$IMAGE_PARENT"
+          IMAGE_FILE=$(find "$IMAGE_PARENT" -type f -name system.img -print -quit)
+          test -n "$IMAGE_FILE"
+          IMAGE_DIR=$(dirname "$IMAGE_FILE")
+          printf 'ANDROID_SDK_ROOT=%s\nANDROID_API=%s\nIMAGE_DIR=%s\n' \
+            "$ANDROID_SDK_ROOT" "$ANDROID_API" "$IMAGE_DIR" > /tmp/runtime/paths.env
+          chmod +x "$ANDROID_SDK_ROOT/emulator/emulator" "$ANDROID_SDK_ROOT/platform-tools/adb"
+
+      - name: Boot Android
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/runtime/paths.env
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          AVD="$HOME/.android/avd/evermore.avd"
+          mkdir -p "$AVD"
+          cat > "$HOME/.android/avd/evermore.ini" <<EOF
+          avd.ini.encoding=UTF-8
+          path=$AVD
+          path.rel=avd/evermore.avd
+          target=android-$ANDROID_API
+          EOF
+          cat > "$AVD/config.ini" <<EOF
+          AvdId=evermore
+          PlayStore.enabled=false
+          abi.type=x86_64
+          avd.ini.displayname=Evermore QooApp Intel
+          avd.ini.encoding=UTF-8
+          disk.dataPartition.size=12G
+          fastboot.forceColdBoot=yes
+          fastboot.forceFastBoot=no
+          hw.accelerometer=yes
+          hw.audioInput=no
+          hw.battery=yes
+          hw.camera.back=none
+          hw.camera.front=none
+          hw.cpu.arch=x86_64
+          hw.cpu.ncore=4
+          hw.gps=yes
+          hw.gpu.enabled=yes
+          hw.gpu.mode=auto
+          hw.keyboard=yes
+          hw.lcd.density=420
+          hw.lcd.height=2400
+          hw.lcd.width=1080
+          hw.mainKeys=no
+          hw.ramSize=6144
+          image.sysdir.1=$IMAGE_DIR/
+          runtime.network.latency=none
+          runtime.network.speed=full
+          sdcard.size=1024M
+          showDeviceFrame=no
+          skin.dynamic=yes
+          skin.name=1080x2400
+          skin.path=_no_skin
+          tag.display=Google APIs
+          tag.id=google_apis
+          vm.heapSize=768
+          EOF
+          nohup "$ANDROID_SDK_ROOT/emulator/emulator" @evermore \
+            -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim \
+            -camera-back none -camera-front none -memory 6144 -cores 4 -netdelay none -netspeed full \
+            > artifacts/emulator.log 2>&1 &
+          echo $! > artifacts/emulator.pid
+          for i in $(seq 1 240); do adb get-state >/dev/null 2>&1 && break; sleep 3; done
+          for i in $(seq 1 240); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break
+            sleep 3
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1
+          adb shell input keyevent 82 || true
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell settings put global package_verifier_enable 0 || true
+          adb shell settings put global verifier_verify_adb_installs 0 || true
+          adb shell svc wifi enable || true
+          adb shell svc data enable || true
+          adb devices -l | tee artifacts/adb-devices.txt
+          adb shell getprop ro.product.cpu.abilist | tee artifacts/abilist.txt
+          adb shell getprop ro.dalvik.vm.native.bridge | tee artifacts/native-bridge.txt
+
+      - name: Install QooApp, fetch Evermore, and open referral
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/runtime/paths.env
+          export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator:$PATH"
+          exec > >(tee artifacts/controller.log) 2>&1
+
+          snap() {
+            local name="$1"
+            adb exec-out screencap -p > "artifacts/${name}.png" || true
+            adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/window.xml "artifacts/${name}.xml" >/dev/null 2>&1 || true
+          }
+          installed() { adb shell pm path "$EVERMORE_PKG" 2>/dev/null | grep -q '^package:'; }
+
+          cat > /tmp/ui.py <<'PY'
+          import re, subprocess, sys, xml.etree.ElementTree as ET
+          def adb(*args):
+              return subprocess.run(['adb', *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, timeout=40, check=False).stdout
+          adb('shell','uiautomator','dump','/sdcard/window.xml')
+          adb('pull','/sdcard/window.xml','/tmp/window.xml')
+          root=ET.parse('/tmp/window.xml').getroot(); nodes=[]
+          for e in root.iter('node'):
+              a=e.attrib; m=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',a.get('bounds',''))
+              if not m: continue
+              x1,y1,x2,y2=map(int,m.groups())
+              nodes.append({'vals':[a.get('text','').strip(),a.get('content-desc','').strip(),a.get('resource-id','').strip()],
+                            'click':a.get('clickable')=='true','enabled':a.get('enabled')!='false',
+                            'x':(x1+x2)//2,'y':(y1+y2)//2,'class':a.get('class','')})
+          cmd=sys.argv[1]
+          if cmd=='dump':
+              print(' | '.join(v for n in nodes for v in n['vals'][:2] if v)); raise SystemExit(0)
+          pat=re.compile(sys.argv[2],re.I); exact=cmd=='tap-exact'; c=[]
+          for n in nodes:
+              if not n['enabled']: continue
+              if any((pat.fullmatch(v) if exact else pat.search(v)) for v in n['vals'] if v): c.append(n)
+          if not c: raise SystemExit(1)
+          c.sort(key=lambda n:(0 if n['click'] else 1,n['y']))
+          n=c[0]; adb('shell','input','tap',str(n['x']),str(n['y'])); print(n)
+          PY
+          ui(){ python3 /tmp/ui.py "$@"; }
+
+          adb install -r -g /tmp/runtime/QooApp.apk | tee artifacts/qooapp-install.txt
+          adb shell appops set "$QOOAPP_PKG" REQUEST_INSTALL_PACKAGES allow || true
+          adb shell appops set "$QOOAPP_PKG" MANAGE_EXTERNAL_STORAGE allow || true
+          adb shell appops set "$QOOAPP_PKG" RUN_IN_BACKGROUND allow || true
+          adb shell dumpsys deviceidle whitelist +"$QOOAPP_PKG" || true
+
+          adb shell monkey -p "$QOOAPP_PKG" -c android.intent.category.LAUNCHER 1 >/dev/null || true
+          sleep 10
+          snap 01-qooapp-launch
+
+          # Dismiss onboarding/consent without creating an account.
+          for i in $(seq 1 30); do
+            screen=$(ui dump 2>/dev/null || true); echo "onboard[$i] $screen"
+            ui tap 'Agree|Accept|Continue|Start|Skip|Next|Got it|Allow|OK' || true
+            if printf '%s' "$screen" | grep -Eqi 'Search|Games|Home|Featured|Updates'; then break; fi
+            sleep 3
+          done
+          snap 02-qooapp-ready
+
+          # Try QooApp catalog deeplinks first.
+          for target in \
+            "https://apps.qoo-app.com/en/app/$QOOAPP_APP_ID" \
+            "https://m-apps.qoo-app.com/en-US/app/$QOOAPP_APP_ID" \
+            "qooapp://apps/$QOOAPP_APP_ID"; do
+            echo "opening $target"
+            adb shell am start -W -a android.intent.action.VIEW -d "$target" -p "$QOOAPP_PKG" || true
+            sleep 8
+            screen=$(ui dump 2>/dev/null || true); echo "$screen"
+            if printf '%s' "$screen" | grep -Eqi 'Evermore|Download|Install'; then break; fi
+          done
+          snap 03-evermore-catalog
+
+          # Search fallback.
+          screen=$(ui dump 2>/dev/null || true)
+          if ! printf '%s' "$screen" | grep -Eqi 'Evermore|Download|Install'; then
+            ui tap 'Search' || true
+            sleep 2
+            adb shell input text 'Evermore%20Arcade'
+            adb shell input keyevent 66
+            sleep 10
+            ui tap 'Evermore' || true
+            sleep 8
+          fi
+          snap 04-evermore-detail
+
+          # Request download/install and handle system installer screens.
+          for i in $(seq 1 180); do
+            installed && break
+            screen=$(ui dump 2>/dev/null || true); echo "download[$i] $screen"
+            ui tap-exact '^Download$' || ui tap-exact '^Install$' || ui tap-exact '^Get$' || \
+              ui tap 'Update|Continue|Allow|Settings|Install anyway|OK|Done|Retry|Try again' || true
+            if printf '%s' "$screen" | grep -qi 'Allow from this source'; then
+              adb shell input tap 900 390 || true
+              sleep 2
+              adb shell input keyevent 4 || true
+            fi
+            if (( i % 15 == 0 )); then snap "download-progress-${i}"; fi
+            sleep 4
+          done
+
+          # Root/cache fallback if QooApp downloaded package but installer did not finish.
+          if ! installed; then
+            adb root || true
+            adb wait-for-device
+            for i in $(seq 1 120); do
+              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break
+              sleep 2
+            done
+            adb shell find /data/user/0/$QOOAPP_PKG /sdcard/Android/data/$QOOAPP_PKG /sdcard/Download \
+              -type f 2>/dev/null | tee artifacts/qooapp-downloaded-files.txt || true
+            mkdir -p /tmp/qoo-cache
+            adb pull /data/user/0/$QOOAPP_PKG /tmp/qoo-cache/private >/dev/null 2>&1 || true
+            adb pull /sdcard/Android/data/$QOOAPP_PKG /tmp/qoo-cache/external >/dev/null 2>&1 || true
+            mapfile -t APKS < <(find /tmp/qoo-cache -type f -iname '*.apk' -print 2>/dev/null)
+            printf '%s\n' "${APKS[@]:-}" | tee artifacts/qooapp-apk-candidates.txt
+            if [ "${#APKS[@]}" -gt 0 ]; then
+              adb install-multiple -r -t -g "${APKS[@]}" | tee artifacts/qooapp-cache-install.txt || true
+            fi
+          fi
+
+          if installed; then
+            echo installed=yes | tee artifacts/install-status.txt
+            adb shell pm path "$EVERMORE_PKG" | tee artifacts/evermore-package-paths.txt
+            adb logcat -c || true
+            adb shell monkey -p "$EVERMORE_PKG" -c android.intent.category.LAUNCHER 1 | tee artifacts/first-launch.txt || true
+            sleep 20; snap 05-evermore-first-launch
+            sleep 25; snap 06-evermore-first-launch-45s
+            adb shell am force-stop "$EVERMORE_PKG" || true
+            adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE \
+              -d "$REFERRAL_URI" -p "$EVERMORE_PKG" | tee artifacts/referral-custom.txt || true
+            sleep 12; snap 07-referral-custom-12s
+            sleep 25; snap 08-referral-custom-37s
+            adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE \
+              -d "$REFERRAL_PAGE" -p "$EVERMORE_PKG" | tee artifacts/referral-https.txt || true
+            sleep 12; snap 09-referral-https
+          else
+            echo installed=no | tee artifacts/install-status.txt
+          fi
+          adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE \
+            -d "$REFERRAL_URI" > artifacts/referral-handlers.txt 2>&1 || true
+          adb shell dumpsys activity activities > artifacts/activities.txt || true
+          adb logcat -d -v threadtime > artifacts/logcat.txt || true
+          TOP=$(adb shell dumpsys activity activities | sed -n 's/.*mResumedActivity:.* \([^ ]*\) .*/\1/p' | head -n1 | tr -d '\r')
+          {
+            echo "evermore_installed=$(installed && echo yes || echo no)"
+            echo "top_activity=$TOP"
+            echo "referral_uri=$REFERRAL_URI"
+            echo "android=$(adb shell getprop ro.build.version.release | tr -d '\r')"
+            echo "sdk=$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+            echo "abilist=$(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+          } | tee artifacts/RESULT.txt
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-qooapp-client-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
