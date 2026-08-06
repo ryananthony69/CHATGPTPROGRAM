@@ -2,7 +2,9 @@ name: Evermore direct PR emulator
 
 on:
   workflow_run:
-    workflows: ["Evermore source probe"]
+    workflows:
+      - "Evermore source probe"
+      - "Evermore referral Android emulator"
     types: [completed]
   push:
     branches: [main]
