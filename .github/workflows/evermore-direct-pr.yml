@@ -1,6 +1,11 @@
 name: Evermore direct PR emulator
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/evermore/**'
+      - '.github/workflows/evermore-direct-pr.yml'
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
@@ -14,7 +19,7 @@ concurrency:
 
 jobs:
   open-referral:
-    if: contains(github.event.pull_request.title || 'manual', 'Evermore direct XAPK')
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.title || '', 'Evermore direct XAPK')
     runs-on: ubuntu-latest
     timeout-minutes: 55
     env:
