@@ -16,7 +16,6 @@ jobs:
     env:
       PKG: com.evermoregames.evermorearcade
       REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
-      QOOAPP_ID: '150473'
 
     steps:
       - name: Check out branch
@@ -29,92 +28,246 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - name: Resolve Evermore package from QooApp
+      - name: Download Evermore through QooApp mobile API
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p artifacts /tmp/evermore-apks
-          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36'
-
-          curl --silent --show-error --location --compressed \
-            --connect-timeout 30 --max-time 120 \
-            -A "$UA" \
-            -H 'Accept: application/json, text/plain, */*' \
-            -H 'Content-Type: application/json' \
-            -H 'Origin: https://qoopy.leadrdrk.com' \
-            -H 'Referer: https://qoopy.leadrdrk.com/' \
-            --data "{\"id\":\"$QOOAPP_ID\"}" \
-            -D artifacts/qoopy-headers.txt \
-            https://qoopy.leadrdrk.com/api/v2/app \
-            -o artifacts/qoopy-response.json
-
           python3 - <<'PY'
-          import json, pathlib, sys
-          source = pathlib.Path('artifacts/qoopy-response.json')
-          try:
-              payload = json.loads(source.read_text())
-          except Exception as exc:
-              print(f'Qoopy did not return JSON: {exc}', file=sys.stderr)
-              print(source.read_text(errors='replace')[:2000], file=sys.stderr)
-              raise SystemExit(20)
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import secrets
+          import sys
+          import time
+          from urllib.parse import urlparse
 
-          data = payload.get('data') or {}
-          urls = []
-          if data.get('download'):
-              urls.append(('base.apk', data['download']))
-          for index, split in enumerate(data.get('split_apks') or [], 1):
-              url = split.get('url')
-              if url:
-                  urls.append((f'split-{index:03d}.apk', url))
+          import requests
 
+          PKG = os.environ['PKG']
+          OUT = pathlib.Path('/tmp/evermore-apks')
+          ART = pathlib.Path('artifacts')
+          OUT.mkdir(parents=True, exist_ok=True)
+          ART.mkdir(parents=True, exist_ok=True)
+
+          device_id = secrets.token_hex(8)
+          session = requests.Session()
+          session.headers.update({'Accept-Encoding': 'gzip', 'Device-Id': device_id})
+
+          clients = [
+              ('9.3.0', 90300),
+              ('9.1.1', 90101),
+              ('9.0.0', 90000),
+              ('8.1.7', 317),
+              ('8.1.6', 316),
+          ]
+          common = {
+              'supported_abis': 'arm64-v8a,armeabi-v7a',
+              'sdk_version': '31',
+              'locale': 'en',
+              'system_locale': 'en_US',
+              'device': 'oriole',
+              'device_model': 'Pixel 6',
+              'screen': '1080,2400',
+              'density': '420',
+              'opengl': '196610',
+              'rooted': 'false',
+          }
+
+          chosen = None
+          diagnostics = []
+          info_payload = None
+          token = None
+
+          for version_name, version_code in clients:
+              ua = f'QooApp {version_name}'
+              session.headers['User-Agent'] = ua
+              try:
+                  token_response = session.post(
+                      'https://api.qoo-app.com/v6/users',
+                      params={'version_code': version_code},
+                      data={
+                          'device_id': device_id,
+                          'platform_access_token': device_id,
+                          'type': 4,
+                          'email': 'null',
+                          'version_code': version_code,
+                      },
+                      timeout=45,
+                  )
+                  token_json = token_response.json() if token_response.content else {}
+                  candidate_token = token_json.get('token')
+                  diagnostics.append({
+                      'client': version_name,
+                      'version_code': version_code,
+                      'token_status': token_response.status_code,
+                      'token_received': bool(candidate_token),
+                  })
+                  if not candidate_token:
+                      continue
+
+                  info_headers = {'X-User-Token': candidate_token}
+                  info_params = dict(common)
+                  info_params['version_code'] = version_code
+                  info_response = session.get(
+                      f'https://api.qoo-app.com/v10/apps/{PKG}',
+                      params=info_params,
+                      headers=info_headers,
+                      timeout=60,
+                  )
+                  try:
+                      candidate_info = info_response.json()
+                  except Exception:
+                      candidate_info = {'raw': info_response.text[:2000]}
+                  diagnostics[-1].update({
+                      'info_status': info_response.status_code,
+                      'info_has_data': bool(candidate_info.get('data')),
+                  })
+                  if info_response.ok and candidate_info.get('data'):
+                      chosen = (version_name, version_code)
+                      token = candidate_token
+                      info_payload = candidate_info
+                      break
+              except Exception as exc:
+                  diagnostics.append({
+                      'client': version_name,
+                      'version_code': version_code,
+                      'error': f'{type(exc).__name__}: {exc}',
+                  })
+
+          ART.joinpath('qooapp-client-attempts.json').write_text(json.dumps(diagnostics, indent=2))
+          if not chosen or not token or not info_payload:
+              raise SystemExit('QooApp mobile API did not return Evermore metadata')
+
+          version_name, version_code = chosen
+          data = info_payload['data']
+          ART.joinpath('qooapp-info.json').write_text(json.dumps(info_payload, indent=2))
           summary = {
-              'api_code': payload.get('code'),
-              'api_message': payload.get('message'),
+              'qooapp_client': version_name,
+              'qooapp_client_code': version_code,
               'id': data.get('id'),
               'package_id': data.get('package_id'),
-              'display_name': data.get('display_name'),
-              'version_name': (data.get('apk') or {}).get('version_name'),
-              'version_code': (data.get('apk') or {}).get('version_code'),
+              'display_name': data.get('display_name') or data.get('app_name'),
               'is_apk_ready': data.get('is_apk_ready'),
-              'file_count': len(urls),
+              'apk': data.get('apk'),
           }
-          pathlib.Path('artifacts/qoopy-summary.json').write_text(json.dumps(summary, indent=2))
+          ART.joinpath('qooapp-summary.json').write_text(json.dumps(summary, indent=2))
           print(json.dumps(summary, indent=2))
 
-          if data.get('package_id') not in (None, 'com.evermoregames.evermorearcade'):
+          if data.get('package_id') not in (None, PKG):
               raise SystemExit(f'Unexpected package returned: {data.get("package_id")}')
-          if not urls:
-              raise SystemExit('QooApp entry has no downloadable APK files')
+          if data.get('is_apk_ready') is False:
+              raise SystemExit('QooApp reports the Evermore APK is not ready')
 
-          with open('/tmp/evermore-urls.tsv', 'w') as out:
-              for name, url in urls:
-                  out.write(f'{name}\t{url}\n')
+          session.headers['User-Agent'] = f'QooApp {version_name}'
+          auth_headers = {'X-User-Token': token}
+
+          def download(url, destination, *, params=None, headers=None):
+              destination = pathlib.Path(destination)
+              temp = destination.with_suffix(destination.suffix + '.part')
+              with session.get(url, params=params, headers=headers or {}, stream=True,
+                               allow_redirects=True, timeout=(45, 1800)) as response:
+                  response.raise_for_status()
+                  meta = {
+                      'requested_url': url,
+                      'final_url': response.url,
+                      'status': response.status_code,
+                      'content_type': response.headers.get('content-type'),
+                      'content_length': response.headers.get('content-length'),
+                      'content_disposition': response.headers.get('content-disposition'),
+                  }
+                  with temp.open('wb') as output:
+                      for chunk in response.iter_content(1024 * 1024):
+                          if chunk:
+                              output.write(chunk)
+              temp.replace(destination)
+              return meta
+
+          download_params = dict(common)
+          download_params.update({
+              'version_code': version_code,
+              'version_name': version_name,
+              'base_apk_version': 0,
+              'base_apk_md5': 'null',
+              'type': 'app',
+              'package_id': 'com.qooapp.qoohelper',
+              'os': 'android 12',
+              'device_id': device_id,
+              'android_id': device_id,
+          })
+          base_meta = download(
+              f'https://api.qoo-app.com/v6/apps/{PKG}/download',
+              OUT / 'base.apk',
+              params=download_params,
+              headers=auth_headers,
+          )
+          ART.joinpath('qooapp-base-response.json').write_text(json.dumps(base_meta, indent=2))
+
+          # QooApp metadata exposes split-package URLs when an app bundle is used.
+          # Collect only URLs found inside fields whose path identifies an APK/download/split.
+          candidates = []
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      walk(child, path + (str(key),))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      walk(child, path + (str(index),))
+              elif isinstance(value, str) and value.startswith(('http://', 'https://')):
+                  joined = '.'.join(path).lower()
+                  lower = value.lower()
+                  if ('split' in joined or 'apk' in joined or 'download' in joined or
+                      lower.endswith('.apk') or 'qoo-apk.com' in lower):
+                      candidates.append((joined, value))
+          walk(data)
+
+          base_final = base_meta.get('final_url', '')
+          seen = {base_final}
+          split_meta = []
+          split_index = 0
+          for path, url in candidates:
+              if url in seen:
+                  continue
+              seen.add(url)
+              # Exclude ordinary artwork and web links even if an ancestor happened to say APK.
+              lower = url.lower()
+              if any(token in lower for token in ('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+                  continue
+              split_index += 1
+              destination = OUT / f'split-{split_index:03d}.apk'
+              try:
+                  meta = download(url, destination, headers=auth_headers)
+                  meta['metadata_path'] = path
+                  split_meta.append(meta)
+              except Exception as exc:
+                  split_meta.append({'url': url, 'metadata_path': path, 'error': f'{type(exc).__name__}: {exc}'})
+          ART.joinpath('qooapp-split-responses.json').write_text(json.dumps(split_meta, indent=2))
+
+          # Keep only real ZIP/APK files. Save unexpected responses for diagnosis.
+          valid = []
+          invalid = []
+          for path in sorted(OUT.glob('*.apk')):
+              head = path.read_bytes()[:4]
+              if head[:2] == b'PK':
+                  valid.append(path)
+              else:
+                  invalid.append({'name': path.name, 'size': path.stat().st_size, 'head_hex': head.hex()})
+                  path.rename(path.with_suffix(path.suffix + '.invalid'))
+          ART.joinpath('invalid-downloads.json').write_text(json.dumps(invalid, indent=2))
+          if not valid:
+              raise SystemExit('QooApp returned no valid APK files')
+
+          manifest = []
+          for path in valid:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              manifest.append({'name': path.name, 'size': path.stat().st_size, 'sha256': digest})
+          ART.joinpath('apk-manifest.json').write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2))
           PY
 
-      - name: Download Evermore base and split APKs
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36'
-          : > artifacts/download-log.txt
-
-          while IFS=$'\t' read -r name url; do
-            [ -n "$name" ] && [ -n "$url" ] || continue
-            echo "Downloading $name" | tee -a artifacts/download-log.txt
-            curl --fail --show-error --location --retry 5 --retry-all-errors \
-              --connect-timeout 45 --max-time 1800 \
-              -A "$UA" -e 'https://m-apps.qoo-app.com/en-US/app/150473' \
-              "$url" -o "/tmp/evermore-apks/$name"
-            file "/tmp/evermore-apks/$name" | tee -a artifacts/download-log.txt
-            test "$(head -c 2 "/tmp/evermore-apks/$name")" = 'PK'
-            unzip -tq "/tmp/evermore-apks/$name" >/dev/null
-          done < /tmp/evermore-urls.tsv
-
-          find /tmp/evermore-apks -type f -iname '*.apk' -printf '%s %f\n' | sort -n | tee artifacts/downloaded-files.txt
-          find /tmp/evermore-apks -type f -iname '*.apk' -print0 | xargs -0 sha256sum | tee artifacts/apk-sha256.txt
-          APK_COUNT=$(find /tmp/evermore-apks -type f -iname '*.apk' | wc -l)
-          [ "$APK_COUNT" -gt 0 ]
-          echo "apk_count=$APK_COUNT" | tee artifacts/download-status.txt
+          find /tmp/evermore-apks -maxdepth 1 -type f -printf '%s %f\n' | sort -n | tee artifacts/downloaded-files.txt
 
       - name: Write emulator test script
         shell: bash
@@ -144,7 +297,7 @@ jobs:
           adb shell svc wifi enable || true
           adb shell svc data enable || true
 
-          mapfile -d '' APKS < <(find /tmp/evermore-apks -type f -iname '*.apk' -print0)
+          mapfile -d '' APKS < <(find /tmp/evermore-apks -maxdepth 1 -type f -iname '*.apk' -print0)
           echo "Installing ${#APKS[@]} APK file(s)"
           printf '%s\n' "${APKS[@]}" | tee artifacts/install-file-list.txt
           adb install-multiple -r -t -g "${APKS[@]}" | tee artifacts/install.txt
