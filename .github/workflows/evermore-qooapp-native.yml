@@ -1,6 +1,12 @@
 name: Evermore QooApp native emulator
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/evermore-qooapp-native.yml'
+      - '.github/evermore/qooapp-native-run.sh'
+      - '.github/evermore/patch-direct-apk.py'
   schedule:
     - cron: '*/5 * * * *'
   workflow_run:
