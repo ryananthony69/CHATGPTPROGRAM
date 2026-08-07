@@ -1,0 +1,66 @@
+name: QooApp JADX endpoint inspection
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/qooapp-jadx-inspect.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      QOOAPP_APK_URL: https://d.qoo-apk.com/880/apk/com.qooapp.qoohelper-20260708152301.apk
+    steps:
+      - name: Download QooApp and JADX
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p /tmp/jadx /tmp/qoo out
+          curl --fail --location --retry 5 --retry-all-errors "$QOOAPP_APK_URL" -o /tmp/qoo/QooApp.apk
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://github.com/skylot/jadx/releases/download/v1.5.3/jadx-1.5.3.zip \
+            -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          chmod +x /tmp/jadx/bin/jadx
+          /tmp/jadx/bin/jadx --version | tee out/jadx-version.txt
+
+      - name: Decompile and isolate QooApp download/API code
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p /tmp/src out/relevant
+          /tmp/jadx/bin/jadx -d /tmp/src --no-res --deobf --show-bad-code /tmp/qoo/QooApp.apk \
+            > out/jadx.log 2>&1 || true
+
+          grep -RIlE 'apps/%s/download|/store/v11/apps|apk_url|apk_download_url|api\.qoo-app\.com|api\.qqaoop\.com|getApkUrl|getApkCdn' \
+            /tmp/src/sources 2>/dev/null | sort > out/relevant-files.txt || true
+
+          n=0
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            n=$((n+1))
+            rel="${file#/tmp/src/sources/}"
+            safe=$(printf '%s' "$rel" | tr '/' '_' | tr -c 'A-Za-z0-9._-' '_')
+            cp "$file" "out/relevant/${n}-${safe}"
+          done < out/relevant-files.txt
+
+          grep -RniE -C 12 'apps/%s/download|/store/v11/apps|apk_url|apk_download_url|api\.qoo-app\.com|api\.qqaoop\.com|getApkUrl|getApkCdn' \
+            /tmp/src/sources 2>/dev/null > out/context.txt || true
+
+          grep -RniE -C 8 'Authorization|User-Agent|X-[A-Za-z-]+|device_id|android_id|uuid|qooapp_uuid|version_code|country|locale|lang|token' \
+            $(cat out/relevant-files.txt 2>/dev/null) 2>/dev/null > out/headers-context.txt || true
+
+          find out/relevant -type f -maxdepth 1 -printf '%f %s\n' | sort > out/copied-files.txt
+
+      - name: Upload endpoint decompilation
+        uses: actions/upload-artifact@v4
+        with:
+          name: qooapp-jadx-endpoints
+          path: out
+          retention-days: 3
