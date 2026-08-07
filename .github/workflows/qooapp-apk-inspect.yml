@@ -1,0 +1,46 @@
+name: QooApp APK static inspection relay
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/qooapp-apk-inspect.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      QOOAPP_APK_URL: https://d.qoo-apk.com/880/apk/com.qooapp.qoohelper-20260708152301.apk
+    steps:
+      - name: Download and index QooApp 9.4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p relay
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$QOOAPP_APK_URL" -o relay/QooApp-9.4.0.apk
+          test "$(head -c 2 relay/QooApp-9.4.0.apk)" = 'PK'
+          unzip -tq relay/QooApp-9.4.0.apk >/dev/null
+          sha256sum relay/QooApp-9.4.0.apk | tee relay/sha256.txt
+          unzip -l relay/QooApp-9.4.0.apk > relay/files.txt
+          strings relay/QooApp-9.4.0.apk | grep -Eai 'qoo-app|qooapp|api\.|/v[0-9]+/|download|apk' \
+            | head -n 5000 > relay/apk-strings.txt || true
+          mkdir -p /tmp/qoo-unzip
+          unzip -q relay/QooApp-9.4.0.apk -d /tmp/qoo-unzip
+          find /tmp/qoo-unzip -type f \( -name 'classes*.dex' -o -name '*.so' -o -name '*.json' -o -name '*.xml' \) -print0 \
+            | xargs -0 -I{} sh -c 'strings "$1" 2>/dev/null' _ {} \
+            | grep -Eai 'https?://|api\.qoo|qoo-app|qooapp|/apps/|/download|apk' \
+            | sort -u | head -n 20000 > relay/all-endpoint-strings.txt || true
+
+      - name: Upload QooApp APK and endpoint strings
+        uses: actions/upload-artifact@v4
+        with:
+          name: qooapp-9.4-static
+          path: relay
+          retention-days: 3
+          compression-level: 0
