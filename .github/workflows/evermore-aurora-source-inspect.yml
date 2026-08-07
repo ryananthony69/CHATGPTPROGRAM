@@ -22,27 +22,28 @@ jobs:
           cd aurora
           git rev-parse HEAD | tee ../artifacts/aurora-head.txt
           git log -1 --format='%H%n%ci%n%s' | tee ../artifacts/aurora-commit.txt
+          find . -maxdepth 4 -type f | sort > ../artifacts/file-list.txt
           printf '%s\n' '=== dependency/build references ===' > ../artifacts/aurora-grep.txt
-          rg -n -i 'gplayapi|auroraoss\.com|api/auth|amiblocked|anonymous|web.?api|download' \
-            --glob '*.kt' --glob '*.java' --glob '*.xml' --glob '*.gradle' --glob '*.kts' --glob '*.toml' \
-            . >> ../artifacts/aurora-grep.txt || true
+          grep -RniE --include='*.kt' --include='*.java' --include='*.xml' --include='*.gradle' --include='*.kts' --include='*.toml' \
+            'gplayapi|auroraoss\.com|api/auth|amiblocked|anonymous|web.?api|download' . \
+            >> ../artifacts/aurora-grep.txt || true
           printf '%s\n' '=== files mentioning likely API classes ===' > ../artifacts/matching-files.txt
-          rg -l -i 'gplayapi|auroraoss\.com|api/auth|anonymous|web.?api|download' \
-            --glob '*.kt' --glob '*.java' --glob '*.gradle' --glob '*.kts' --glob '*.toml' . \
+          grep -RliE --include='*.kt' --include='*.java' --include='*.gradle' --include='*.kts' --include='*.toml' \
+            'gplayapi|auroraoss\.com|api/auth|anonymous|web.?api|download' . \
             | sort >> ../artifacts/matching-files.txt || true
-          # Copy the most relevant source files verbatim for post-run inspection.
           mkdir -p ../artifacts/source
-          while IFS= read -r f; do
+          tail -n +2 ../artifacts/matching-files.txt | while IFS= read -r f; do
             [ -n "$f" ] || continue
             case "$f" in
               *Auth*|*Api*|*API*|*Download*|*Provider*|*Repository*|*build.gradle*|*libs.versions.toml)
-                mkdir -p "../artifacts/source/$(dirname "$f")"
-                cp "$f" "../artifacts/source/$f" || true
+                clean="${f#./}"
+                mkdir -p "../artifacts/source/$(dirname "$clean")"
+                cp "$f" "../artifacts/source/$clean" || true
                 ;;
             esac
-          done < ../artifacts/matching-files.txt
+          done
           cd ..
-          find artifacts/source -type f -maxdepth 12 -print | sort | tee artifacts/copied-files.txt
+          find artifacts/source -type f -print | sort | tee artifacts/copied-files.txt
 
       - name: Upload source diagnostics
         if: always()
