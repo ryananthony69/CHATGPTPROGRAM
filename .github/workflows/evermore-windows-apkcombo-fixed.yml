@@ -1,0 +1,143 @@
+name: Evermore Windows fixed APKCombo emulator
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  open-referral:
+    runs-on: windows-2025
+    timeout-minutes: 65
+    env:
+      PKG: com.evermoregames.evermorearcade
+      VERSION: 2.1.1
+      REFERRAL_HTTPS: https://evermoregamesllc.com/referral?code=J32R6Q
+      REFERRAL_CUSTOM: evermorearcade://referral?code=J32R6Q
+
+    steps:
+      - name: Download Evermore with corrected APKCombo URL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifacts, C:\evermore-download, C:\evermore-apks | Out-Null
+          $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          $cookies = 'C:\evermore-download\cookies.txt'
+          $variantPage = "https://apkcombo.app/evermore-arcade-win-cash/$env:PKG/download/phone-$env:VERSION-apk"
+          $effective = (& curl.exe -sS -L -A $ua -c $cookies -b $cookies -e 'https://apkcombo.com/' -o NUL -w '%{url_effective}' $variantPage).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $effective) { throw 'Could not resolve APKCombo variant URL.' }
+          $checkin = (& curl.exe -fsSL -A $ua -c $cookies -b $cookies -e $effective 'https://apkcombo.app/checkin').Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $checkin) { throw 'APKCombo checkin failed.' }
+          $sep = if ($effective.Contains('?')) { '&' } else { '?' }
+          $downloadUrl = "$effective$sep$checkin"
+          "variant_page=$variantPage`neffective_url=$effective`ncheckin=$checkin`nseparator=$sep`nfinal_url=$downloadUrl" | Out-File artifacts\apkcombo-resolution.txt
+
+          $package = 'C:\evermore-download\Evermore.pkg'
+          & curl.exe --fail --location --retry 4 --retry-all-errors --connect-timeout 30 --max-time 2400 -A $ua -e $effective -c $cookies -b $cookies -H 'Accept: application/octet-stream,application/zip,*/*' $downloadUrl -o $package 2>&1 | Tee-Object -FilePath artifacts\download-log.txt
+          if ($LASTEXITCODE -ne 0) { throw "Evermore download failed with curl exit $LASTEXITCODE" }
+          $bytes = Get-Content -Path $package -Encoding Byte -TotalCount 2
+          if ($bytes.Count -ne 2 -or $bytes[0] -ne 0x50 -or $bytes[1] -ne 0x4B) { throw 'Downloaded Evermore payload is not ZIP/APK/XAPK.' }
+          Get-FileHash $package -Algorithm SHA256 | Format-List | Out-File artifacts\package-sha256.txt
+          Get-Item $package | Select-Object FullName,Length | Format-List | Out-File artifacts\package-size.txt
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($package)
+          $nested = @($zip.Entries | Where-Object { $_.FullName -match '\.apk$' })
+          $zip.Dispose()
+          if ($nested.Count -gt 0) { [System.IO.Compression.ZipFile]::ExtractToDirectory($package, 'C:\evermore-apks', $true) }
+          else { Copy-Item $package 'C:\evermore-apks\base.apk' -Force }
+          $apks = @(Get-ChildItem C:\evermore-apks -File -Recurse -Filter *.apk)
+          if (-not $apks) { throw 'No APK files extracted.' }
+          $apks | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Out-File artifacts\apk-files.txt
+
+          $sdkManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter sdkmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          $avdManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter avdmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $sdkManager -or -not $avdManager) { throw 'Android tools missing.' }
+          cmd /c "echo y|`"$sdkManager`" --licenses" | Out-File artifacts\licenses.txt
+          $image = 'system-images;android-31;google_apis;x86_64'
+          & $sdkManager 'platform-tools' 'emulator' 'platforms;android-31' 'build-tools;35.0.0' $image 2>&1 | Tee-Object -FilePath artifacts\sdk-install.txt
+          if ($LASTEXITCODE -ne 0) { throw 'SDK install failed.' }
+          cmd /c "echo no|`"$avdManager`" create avd --force --name evermore --package $image --device pixel_6" 2>&1 | Tee-Object -FilePath artifacts\avd-create.txt
+          if ($LASTEXITCODE -ne 0) { throw 'AVD creation failed.' }
+
+          $aapt = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter aapt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $abis = [System.Collections.Generic.HashSet[string]]::new()
+          foreach ($apk in $apks) {
+            "===== $($apk.FullName) =====" | Out-File artifacts\aapt-badging.txt -Append
+            & $aapt dump badging $apk.FullName 2>&1 | Out-File artifacts\aapt-badging.txt -Append
+            "===== $($apk.FullName) =====" | Out-File artifacts\manifest-xmltree.txt -Append
+            & $aapt dump xmltree $apk.FullName AndroidManifest.xml 2>&1 | Out-File artifacts\manifest-xmltree.txt -Append
+            try {
+              $z = [System.IO.Compression.ZipFile]::OpenRead($apk.FullName)
+              foreach ($entry in $z.Entries) { if ($entry.FullName -match '^lib/([^/]+)/') { [void]$abis.Add($Matches[1]) } }
+              $z.Dispose()
+            } catch {}
+          }
+          "package_native_abis=$([string]::Join(',', @($abis)))" | Out-File artifacts\package-abis.txt
+
+      - name: Boot, install, launch and test referral
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $adb = Join-Path $env:ANDROID_HOME 'platform-tools\adb.exe'
+          $emulator = Join-Path $env:ANDROID_HOME 'emulator\emulator.exe'
+          $args = @('@evermore','-no-window','-gpu','swiftshader_indirect','-no-snapshot','-wipe-data','-noaudio','-no-boot-anim','-no-metrics','-accel','off','-memory','3072','-cores','2','-netdelay','none','-netspeed','full')
+          $proc = Start-Process -FilePath $emulator -ArgumentList $args -RedirectStandardOutput artifacts\emulator-stdout.txt -RedirectStandardError artifacts\emulator-stderr.txt -PassThru
+          "pid=$($proc.Id)" | Out-File artifacts\emulator-pid.txt
+          $ready=$false
+          for($i=0;$i -lt 500;$i++){ & $adb get-state 2>$null|Out-Null; if($LASTEXITCODE -eq 0){$ready=$true;break}; if($proc.HasExited){break}; Start-Sleep 3 }
+          if(-not $ready){ "adb_ready=false`nemulator_exited=$($proc.HasExited)"|Out-File artifacts\RESULT.txt; throw 'ADB did not appear.' }
+          $booted=$false
+          for($i=0;$i -lt 600;$i++){ if(((& $adb shell getprop sys.boot_completed 2>$null).Trim()) -eq '1'){$booted=$true;break}; if($proc.HasExited){break}; Start-Sleep 3 }
+          if(-not $booted){ "adb_ready=true`nbooted=false"|Out-File artifacts\RESULT.txt; throw 'Android did not boot.' }
+          & $adb devices -l | Out-File artifacts\adb-devices.txt
+          & $adb shell getprop ro.product.cpu.abilist | Out-File artifacts\guest-abilist.txt
+          & $adb shell getprop ro.dalvik.vm.native.bridge | Out-File artifacts\native-bridge.txt
+          & $adb shell settings put global window_animation_scale 0
+          & $adb shell settings put global transition_animation_scale 0
+          & $adb shell settings put global animator_duration_scale 0
+          & $adb shell settings put global package_verifier_enable 0
+          & $adb shell settings put global verifier_verify_adb_installs 0
+
+          $apks = @(Get-ChildItem C:\evermore-apks -File -Recurse -Filter *.apk | ForEach-Object FullName)
+          & $adb @(@('install-multiple','-r','-t','-g') + $apks) 2>&1 | Tee-Object -FilePath artifacts\install.txt
+          $installExit=$LASTEXITCODE
+          & $adb shell pm path $env:PKG 2>&1 | Tee-Object -FilePath artifacts\package-paths.txt
+          $installed=(((& $adb shell pm path $env:PKG 2>$null) -match '^package:').Count -gt 0)
+
+          function Snapshot([string]$name){ cmd /c "`"$adb`" exec-out screencap -p > artifacts\$name.png"; & $adb shell uiautomator dump /sdcard/window.xml|Out-Null; & $adb pull /sdcard/window.xml "artifacts\$name.xml"|Out-Null; & $adb shell dumpsys activity activities|Out-File "artifacts\$name-activities.txt" }
+          & $adb shell dumpsys package $env:PKG | Out-File artifacts\package-dump.txt
+          & $adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_CUSTOM 2>&1 | Out-File artifacts\custom-referral-handlers.txt
+          & $adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_HTTPS 2>&1 | Out-File artifacts\https-referral-handlers.txt
+
+          if($installed){
+            & $adb logcat -c
+            & $adb shell monkey -p $env:PKG -c android.intent.category.LAUNCHER 1 2>&1 | Out-File artifacts\first-launch.txt
+            Start-Sleep 20; Snapshot '01-first-launch-20s'; Start-Sleep 30; Snapshot '02-first-launch-50s'
+            & $adb shell am force-stop $env:PKG
+            & $adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_CUSTOM -p $env:PKG 2>&1 | Tee-Object -FilePath artifacts\custom-referral.txt
+            Start-Sleep 15; Snapshot '03-custom-referral-15s'; Start-Sleep 25; Snapshot '04-custom-referral-40s'
+            & $adb shell am force-stop $env:PKG
+            & $adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_HTTPS -p $env:PKG 2>&1 | Tee-Object -FilePath artifacts\https-referral-app.txt
+            Start-Sleep 15; Snapshot '05-https-referral-app-15s'
+          }
+          & $adb shell dumpsys activity activities | Out-File artifacts\activities.txt
+          & $adb shell dumpsys window windows | Out-File artifacts\windows.txt
+          & $adb logcat -d -v threadtime | Out-File artifacts\logcat.txt
+          $top=(((& $adb shell dumpsys activity activities|Out-String)-split "`n")|Where-Object{$_ -match 'mResumedActivity|topResumedActivity'}|Select-Object -First 1).Trim()
+          @("installed=$installed","install_exit=$installExit","package=$env:PKG","guest_abilist=$((& $adb shell getprop ro.product.cpu.abilist).Trim())","native_bridge=$((& $adb shell getprop ro.dalvik.vm.native.bridge).Trim())","top_activity=$top") | Out-File artifacts\RESULT.txt
+          if(-not $installed){throw 'Evermore did not install; inspect ABI and install evidence.'}
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-windows-apkcombo-fixed-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
