@@ -1,0 +1,72 @@
+name: Evermore Aurora source inspection
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect current Aurora Store and GPlayApi implementation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts
+          git clone --depth 1 https://gitlab.com/AuroraOSS/AuroraStore.git aurora
+          git clone --depth 1 https://gitlab.com/AuroraOSS/gplayapi.git gplayapi
+
+          cd aurora
+          git rev-parse HEAD | tee ../artifacts/aurora-head.txt
+          git log -1 --format='%H%n%ci%n%s' | tee ../artifacts/aurora-commit.txt
+          printf '%s\n' '=== Aurora references ===' > ../artifacts/aurora-grep.txt
+          grep -RniE --include='*.kt' --include='*.java' --include='*.xml' --include='*.gradle' --include='*.kts' --include='*.toml' \
+            'gplayapi|auroraoss\.com|api/auth|amiblocked|anonymous|web.?api|download' . \
+            >> ../artifacts/aurora-grep.txt || true
+          cd ../gplayapi
+          git rev-parse HEAD | tee ../artifacts/gplayapi-head.txt
+          git log -1 --format='%H%n%ci%n%s' | tee ../artifacts/gplayapi-commit.txt
+          printf '%s\n' '=== GPlayApi auth/download/web references ===' > ../artifacts/gplayapi-grep.txt
+          grep -RniE --include='*.kt' --include='*.java' --include='*.proto' --include='*.gradle' --include='*.kts' --include='*.toml' \
+            'postAuth|AuthHelper|PurchaseHelper|acquire\(|purchase\(|PlayFile|web|delivery|download|properties|Device' . \
+            >> ../artifacts/gplayapi-grep.txt || true
+          cd ..
+
+          mkdir -p artifacts/source/aurora artifacts/source/gplayapi
+          for f in \
+            aurora/app/src/main/java/com/aurora/Constants.kt \
+            aurora/app/src/main/java/com/aurora/store/data/providers/AuthProvider.kt \
+            aurora/app/src/main/java/com/aurora/store/data/network/HttpClient.kt \
+            aurora/app/src/main/java/com/aurora/store/data/helper/DownloadHelper.kt \
+            aurora/app/src/main/java/com/aurora/store/data/work/DownloadWorker.kt \
+            aurora/gradle/libs.versions.toml; do
+              [ -f "$f" ] || continue
+              cp "$f" artifacts/source/aurora/$(basename "$f")
+          done
+          find gplayapi/lib/src/main -type f \( -name '*.kt' -o -name '*.java' \) | while IFS= read -r f; do
+            case "$f" in
+              *AuthHelper*|*PurchaseHelper*|*IHttpClient*|*HttpClient*|*Device*|*Properties*|*PlayFile*|*WebAppDetails*|*AppDetailsHelper*)
+                rel="${f#gplayapi/}"
+                mkdir -p "artifacts/source/gplayapi/$(dirname "$rel")"
+                cp "$f" "artifacts/source/gplayapi/$rel"
+                ;;
+            esac
+          done
+          find artifacts/source -type f -print | sort > artifacts/copied-files.txt
+
+          # Current dispenser reachability from this runner; no account is created.
+          curl -fsSL -D artifacts/amiblocked-headers.txt https://auroraoss.com/api/amiblocked -o artifacts/amiblocked-body.txt || true
+          curl -fsSL -D artifacts/auth-get-headers.txt https://auroraoss.com/api/auth -o artifacts/auth-get-body.txt || true
+
+      - name: Upload source diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-aurora-source-inspection
+          path: artifacts
+          retention-days: 3

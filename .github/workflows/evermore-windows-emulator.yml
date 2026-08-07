@@ -41,18 +41,18 @@ jobs:
           "ANDROID_HOME=$env:ANDROID_HOME`nEMULATOR_ABI=$env:EMULATOR_ABI" | Tee-Object -FilePath artifacts\runtime-selection.txt
 
           # APKCombo's single-variant flow redirects the version URL to a download endpoint.
-          # APKCD v1.0.3 reaches this endpoint but crashes when Content-Disposition has no filename,
-          # so save the response to an explicit filename instead.
+          # Save the payload to an explicit filename and attach the current check-in token.
           $variantPage = "https://apkcombo.app/evermore-arcade-win-cash/$env:PKG/download/phone-$env:VERSION-apk"
           $effective = (& curl.exe -sS -L -o NUL -w '%{url_effective}' $variantPage).Trim()
           if ($LASTEXITCODE -ne 0 -or -not $effective) { throw 'Could not resolve APKCombo single-variant URL.' }
           $checkin = (& curl.exe -fsSL 'https://apkcombo.app/checkin').Trim()
           if ($LASTEXITCODE -ne 0 -or -not $checkin) { throw 'APKCombo checkin failed.' }
-          $downloadUrl = "$effective&$checkin"
+          $separator = if ($effective.Contains('?')) { '&' } else { '?' }
+          $downloadUrl = "$effective$separator$checkin&package_name=$env:PKG&lang=en"
           "variant_page=$variantPage`neffective_url=$effective`ncheckin=$checkin`nfinal_url=$downloadUrl" | Out-File artifacts\apkcombo-resolution.txt
 
           $package = 'C:\evermore-download\Evermore.pkg'
-          & curl.exe --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 2400 -A 'Mozilla/5.0' $downloadUrl -o $package
+          & curl.exe --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 2400 -A 'Mozilla/5.0' -e $variantPage $downloadUrl -o $package
           if ($LASTEXITCODE -ne 0) { throw "Evermore download failed with curl exit $LASTEXITCODE" }
           $bytes = Get-Content -Path $package -Encoding Byte -TotalCount 2
           if ($bytes.Count -ne 2 -or $bytes[0] -ne 0x50 -or $bytes[1] -ne 0x4B) { throw 'Downloaded Evermore payload is not a ZIP/APK/XAPK.' }
