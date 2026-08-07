@@ -1,0 +1,84 @@
+name: Evermore Windows fixed-checkin referral probe
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  open-referral:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            abi: x86_64
+          - runner: windows-2022
+            abi: arm64-v8a
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 65
+    env:
+      PKG: com.evermoregames.evermorearcade
+      VERSION: 2.1.1
+      EMULATOR_ABI: ${{ matrix.abi }}
+      REFERRAL_HTTPS: https://evermoregamesllc.com/referral?code=J32R6Q
+      REFERRAL_CUSTOM: evermorearcade://referral?code=J32R6Q
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare fixed scripts from the existing emulator workflow
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check -q pyyaml
+          @'
+          import os
+          from pathlib import Path
+          import yaml
+
+          src = Path('.github/workflows/evermore-windows-emulator.yml')
+          doc = yaml.safe_load(src.read_text(encoding='utf-8'))
+          runs = [s['run'] for s in doc['jobs']['open-referral']['steps'] if isinstance(s, dict) and 'run' in s]
+          if len(runs) < 2:
+              raise RuntimeError('Could not extract the two PowerShell run blocks')
+
+          download = runs[0]
+          download = download.replace(
+              "& curl.exe -sS -L -o NUL -w '%{url_effective}' $variantPage",
+              "& curl.exe -A 'Mozilla/5.0' -sS -L -o NUL -w '%{url_effective}' $variantPage",
+          )
+          download = download.replace(
+              "& curl.exe -fsSL 'https://apkcombo.app/checkin'",
+              "& curl.exe -A 'Mozilla/5.0' -fsSL 'https://apkcombo.app/checkin'",
+          )
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          (temp / 'evermore-download-fixed.ps1').write_text(download, encoding='utf-8')
+          (temp / 'evermore-launch.ps1').write_text(runs[1], encoding='utf-8')
+          print('Prepared original launch logic with one change: the same User-Agent is now used for APKCombo variant resolution, check-in, and package download.')
+          '@ | Set-Content -Encoding UTF8 "$env:RUNNER_TEMP\prepare-evermore.py"
+          python "$env:RUNNER_TEMP\prepare-evermore.py"
+
+      - name: Download Evermore and prepare Android SDK
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\evermore-download-fixed.ps1"
+
+      - name: Boot Android, install Evermore, and open referral
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\evermore-launch.ps1"
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-windows-fixed-${{ matrix.runner }}-${{ matrix.abi }}
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
