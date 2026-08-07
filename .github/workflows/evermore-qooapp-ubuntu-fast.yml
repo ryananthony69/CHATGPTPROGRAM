@@ -1,0 +1,69 @@
+name: Evermore QooApp Ubuntu fast
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/evermore-qooapp-ubuntu-fast.yml'
+      - '.github/evermore/qooapp-ubuntu-fast.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evermore-qooapp-ubuntu-fast
+  cancel-in-progress: true
+
+jobs:
+  open-referral:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QOOAPP_APK_URL: https://d.qoo-apk.com/880/apk/com.qooapp.qoohelper-20260708152301.apk
+    steps:
+      - name: Check out fast controller
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Enable KVM and download QooApp 9.4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/qooapp
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm | tee artifacts/kvm.txt
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$QOOAPP_APK_URL" -o /tmp/qooapp/QooApp.apk
+          test "$(head -c 2 /tmp/qooapp/QooApp.apk)" = 'PK'
+          unzip -tq /tmp/qooapp/QooApp.apk >/dev/null
+          sha256sum /tmp/qooapp/QooApp.apk | tee artifacts/qooapp-sha256.txt
+          ls -lh /tmp/qooapp/QooApp.apk | tee artifacts/qooapp-size.txt
+
+      - name: Boot Android and run fast Evermore path
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 6144M
+          heap-size: 768M
+          disk-size: 16384M
+          emulator-boot-timeout: 900
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash .github/evermore/qooapp-ubuntu-fast.sh
+
+      - name: Upload fast proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-qooapp-ubuntu-fast-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
