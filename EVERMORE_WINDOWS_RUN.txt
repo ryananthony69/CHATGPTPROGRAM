@@ -1,2 +1,6 @@
 Trigger Windows software-emulated Android run for Evermore referral J32R6Q.
 Retriggered after GitHub Actions incident recovery on 2026-08-07.
+Automation rerun trigger 2026-08-07 after Actions status returned operational.
+Aurora retry trigger after adding Windows marketplace workflow.
+Corrected APKCombo retry trigger.
+Aurora v2 retry trigger.
