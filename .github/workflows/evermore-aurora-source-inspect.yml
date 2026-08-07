@@ -1,0 +1,53 @@
+name: Evermore Aurora source inspection
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect current Aurora Store anonymous/download implementation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts
+          git clone --depth 1 https://gitlab.com/AuroraOSS/AuroraStore.git aurora
+          cd aurora
+          git rev-parse HEAD | tee ../artifacts/aurora-head.txt
+          git log -1 --format='%H%n%ci%n%s' | tee ../artifacts/aurora-commit.txt
+          printf '%s\n' '=== dependency/build references ===' > ../artifacts/aurora-grep.txt
+          rg -n -i 'gplayapi|auroraoss\.com|api/auth|amiblocked|anonymous|web.?api|download' \
+            --glob '*.kt' --glob '*.java' --glob '*.xml' --glob '*.gradle' --glob '*.kts' --glob '*.toml' \
+            . >> ../artifacts/aurora-grep.txt || true
+          printf '%s\n' '=== files mentioning likely API classes ===' > ../artifacts/matching-files.txt
+          rg -l -i 'gplayapi|auroraoss\.com|api/auth|anonymous|web.?api|download' \
+            --glob '*.kt' --glob '*.java' --glob '*.gradle' --glob '*.kts' --glob '*.toml' . \
+            | sort >> ../artifacts/matching-files.txt || true
+          # Copy the most relevant source files verbatim for post-run inspection.
+          mkdir -p ../artifacts/source
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              *Auth*|*Api*|*API*|*Download*|*Provider*|*Repository*|*build.gradle*|*libs.versions.toml)
+                mkdir -p "../artifacts/source/$(dirname "$f")"
+                cp "$f" "../artifacts/source/$f" || true
+                ;;
+            esac
+          done < ../artifacts/matching-files.txt
+          cd ..
+          find artifacts/source -type f -maxdepth 12 -print | sort | tee artifacts/copied-files.txt
+
+      - name: Upload source diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-aurora-source-inspection
+          path: artifacts
+          retention-days: 3
