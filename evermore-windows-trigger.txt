@@ -6,3 +6,4 @@ Trigger ARM64 TCG probe using current APKCombo xid/checkin flow.
 Trigger QooApp API ARM64 probe as alternate package source.
 Probe current official QooApp APK to derive live API client parameters.
 Trigger BunAPK anonymous Google Play download and ARM64 TCG referral probe.
+Test BunAPK with current Aurora Store 4.8.4-76 dispenser user-agent.
