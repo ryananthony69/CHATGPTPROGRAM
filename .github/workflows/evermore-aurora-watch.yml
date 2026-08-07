@@ -1,0 +1,82 @@
+name: Evermore Aurora current-store referral probe
+
+on:
+  pull_request:
+    branches:
+      - evermore-aurora-emulator-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  open-referral:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      AURORA_PKG: com.aurora.store
+      EVERMORE_PKG: com.evermoregames.evermorearcade
+      REFERRAL_URL: https://evermoregamesllc.com/referral?code=J32R6Q
+      AURORA_APK_URL: https://f-droid.org/repo/com.aurora.store_76.apk
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract prepared Aurora controller
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check -q pyyaml
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          src = Path('.github/workflows/evermore-aurora-emulator.yml')
+          doc = yaml.safe_load(src.read_text(encoding='utf-8'))
+          runs = [s['run'] for s in doc['jobs']['open-referral']['steps'] if isinstance(s, dict) and 'run' in s]
+          if len(runs) < 3:
+              raise RuntimeError(f'Expected at least three prepared shell blocks, found {len(runs)}')
+          temp = Path('/tmp')
+          for i, script in enumerate(runs[:3]):
+              p = temp / f'evermore-aurora-step-{i}.sh'
+              p.write_text(script, encoding='utf-8')
+              p.chmod(0o755)
+          print('Prepared original KVM, Aurora download, and emulator-controller scripts.')
+          PY
+
+      - name: Enable KVM access
+        shell: bash
+        run: bash /tmp/evermore-aurora-step-0.sh
+
+      - name: Download current Aurora Store 4.8.4
+        shell: bash
+        run: bash /tmp/evermore-aurora-step-1.sh
+
+      - name: Write prepared emulator controller
+        shell: bash
+        run: bash /tmp/evermore-aurora-step-2.sh
+
+      - name: Boot Android, fetch Evermore from Google Play, and open referral
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 6144M
+          heap-size: 768M
+          disk-size: 16384M
+          emulator-boot-timeout: 1200
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash /tmp/run-evermore-aurora.sh
+
+      - name: Upload screenshots and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-aurora-current-store-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
