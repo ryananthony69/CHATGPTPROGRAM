@@ -1,0 +1,70 @@
+name: Qoopy Evermore API probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/qoopy-evermore-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Query Qoopy app endpoint for Evermore
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p out
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+          set +e
+          curl --http1.1 --location --silent --show-error \
+            -A "$UA" \
+            -H 'Accept: application/json, text/plain, */*' \
+            -H 'Content-Type: application/json' \
+            -H 'Origin: https://qoopy.leadrdrk.com' \
+            -H 'Referer: https://qoopy.leadrdrk.com/' \
+            -D out/headers.txt \
+            -o out/body.txt \
+            -w 'http_code=%{http_code}\nurl_effective=%{url_effective}\ncontent_type=%{content_type}\nsize_download=%{size_download}\n' \
+            --data-binary '{"id":"150473"}' \
+            https://qoopy.leadrdrk.com/api/v2/app \
+            | tee out/curl-result.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "curl_rc=$rc" | tee -a out/curl-result.txt
+          cat out/headers.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          p=Path('out/body.txt')
+          raw=p.read_text(errors='replace')
+          print(raw[:10000])
+          try:
+              data=json.loads(raw)
+              Path('out/body.pretty.json').write_text(json.dumps(data,indent=2,ensure_ascii=False))
+              app=data.get('data') or {}
+              print('code=',data.get('code'))
+              print('message=',data.get('message'))
+              print('id=',app.get('id'))
+              print('package_id=',app.get('package_id'))
+              print('display_name=',app.get('display_name'))
+              print('download=',app.get('download'))
+              print('split_count=',len(app.get('split_apks') or []))
+              for split in app.get('split_apks') or []:
+                  print('split=',split)
+          except Exception as exc:
+              print('json_error=',repr(exc))
+          PY
+
+      - name: Upload Qoopy response
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoopy-evermore-response
+          path: out
+          retention-days: 3
