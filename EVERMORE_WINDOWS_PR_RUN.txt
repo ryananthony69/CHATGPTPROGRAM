@@ -1,0 +1,1 @@
+Trigger PR-discoverable Windows software-emulated Android run for Evermore referral J32R6Q after GitHub Actions recovery on 2026-08-07.
