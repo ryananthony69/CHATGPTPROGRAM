@@ -1,0 +1,198 @@
+name: Evermore Windows Aurora emulator retry v2
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  open-referral:
+    runs-on: windows-2025
+    timeout-minutes: 65
+    env:
+      PKG: com.evermoregames.evermorearcade
+      AURORA_PKG: com.aurora.store
+      AURORA_APK: https://f-droid.org/repo/com.aurora.store_75.apk
+      REFERRAL_CUSTOM: evermorearcade://referral?code=J32R6Q
+      REFERRAL_HTTPS: https://evermoregamesllc.com/referral?code=J32R6Q
+
+    steps:
+      - name: Prepare software Android emulator and Aurora Store
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifacts, C:\evermore-runtime | Out-Null
+          Get-ComputerInfo | Out-File artifacts\host.txt
+          $sdkManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter sdkmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          $avdManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter avdmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $sdkManager -or -not $avdManager) { throw 'Android command-line tools were not found.' }
+          "sdkmanager=$sdkManager`navdmanager=$avdManager`nANDROID_HOME=$env:ANDROID_HOME" | Out-File artifacts\sdk-tools.txt
+          cmd /c "echo y|`"$sdkManager`" --licenses" | Out-File artifacts\licenses.txt
+          $imagePackage = 'system-images;android-31;google_apis;x86_64'
+          & $sdkManager 'platform-tools' 'emulator' 'platforms;android-31' 'build-tools;35.0.0' $imagePackage 2>&1 | Tee-Object -FilePath artifacts\sdk-install.txt
+          if ($LASTEXITCODE -ne 0) { throw 'SDK install failed.' }
+          cmd /c "echo no|`"$avdManager`" create avd --force --name evermore --package $imagePackage --device pixel_6" 2>&1 | Tee-Object -FilePath artifacts\avd-create.txt
+          if ($LASTEXITCODE -ne 0) { throw 'AVD creation failed.' }
+          & curl.exe --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 $env:AURORA_APK -o C:\evermore-runtime\AuroraStore.apk
+          if ($LASTEXITCODE -ne 0) { throw 'Aurora Store download failed.' }
+          try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip=[System.IO.Compression.ZipFile]::OpenRead('C:\evermore-runtime\AuroraStore.apk'); $count=$zip.Entries.Count; $zip.Dispose()
+            "entries=$count" | Out-File artifacts\aurora-zip-check.txt
+          } catch { throw 'Aurora APK was not a valid APK/ZIP.' }
+          Get-FileHash C:\evermore-runtime\AuroraStore.apk -Algorithm SHA256 | Format-List | Out-File artifacts\aurora-sha256.txt
+
+      - name: Boot Android, install Evermore through Aurora, and open referral
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $adb = Join-Path $env:ANDROID_HOME 'platform-tools\adb.exe'
+          $emulator = Join-Path $env:ANDROID_HOME 'emulator\emulator.exe'
+          "adb=$adb`nemulator=$emulator" | Out-File artifacts\runtime-tools.txt
+          $args = @('@evermore','-no-window','-gpu','swiftshader_indirect','-no-snapshot','-wipe-data','-noaudio','-no-boot-anim','-no-metrics','-accel','off','-memory','3072','-cores','2','-netdelay','none','-netspeed','full')
+          $process = Start-Process -FilePath $emulator -ArgumentList $args -RedirectStandardOutput artifacts\emulator-stdout.txt -RedirectStandardError artifacts\emulator-stderr.txt -PassThru
+          "pid=$($process.Id)" | Out-File artifacts\emulator-pid.txt
+
+          $ready=$false
+          for($i=0;$i -lt 500;$i++){
+            & $adb get-state 2>$null | Out-Null
+            if($LASTEXITCODE -eq 0){$ready=$true;break}
+            if($process.HasExited){break}
+            Start-Sleep -Seconds 3
+          }
+          if(-not $ready){ "adb_ready=false`nemulator_exited=$($process.HasExited)"|Out-File artifacts\RESULT.txt; throw 'ADB device did not appear.' }
+          $booted=$false
+          for($i=0;$i -lt 600;$i++){
+            if(((& $adb shell getprop sys.boot_completed 2>$null).Trim()) -eq '1'){$booted=$true;break}
+            if($process.HasExited){break}
+            Start-Sleep -Seconds 3
+          }
+          if(-not $booted){ "adb_ready=true`nbooted=false`nemulator_exited=$($process.HasExited)"|Out-File artifacts\RESULT.txt; throw 'Android did not finish booting.' }
+
+          & $adb devices -l | Out-File artifacts\adb-devices.txt
+          & $adb shell getprop ro.product.cpu.abilist | Out-File artifacts\abilist.txt
+          & $adb shell getprop ro.dalvik.vm.native.bridge | Out-File artifacts\native-bridge.txt
+          & $adb shell getprop | Out-File artifacts\getprop.txt
+          & $adb shell settings put global window_animation_scale 0
+          & $adb shell settings put global transition_animation_scale 0
+          & $adb shell settings put global animator_duration_scale 0
+          & $adb shell settings put global package_verifier_enable 0
+          & $adb shell settings put global verifier_verify_adb_installs 0
+          & $adb shell svc wifi enable
+          & $adb shell svc data enable
+
+          function Snapshot([string]$name){
+            cmd /c "`"$adb`" exec-out screencap -p > artifacts\$name.png"
+            & $adb shell uiautomator dump /sdcard/window.xml | Out-Null
+            & $adb pull /sdcard/window.xml "artifacts\$name.xml" | Out-Null
+            & $adb shell dumpsys activity activities | Out-File "artifacts\$name-activities.txt"
+            & $adb shell dumpsys window windows | Out-File "artifacts\$name-windows.txt"
+          }
+          function Dump-Ui {
+            & $adb shell uiautomator dump /sdcard/window.xml | Out-Null
+            & $adb pull /sdcard/window.xml C:\evermore-runtime\window.xml | Out-Null
+            if(Test-Path C:\evermore-runtime\window.xml){ return Get-Content C:\evermore-runtime\window.xml -Raw }
+            return ''
+          }
+          function Tap-Match([string]$pattern){
+            $xmlText=Dump-Ui
+            if(-not $xmlText){return $false}
+            try{[xml]$doc=$xmlText}catch{return $false}
+            foreach($node in $doc.SelectNodes('//node')){
+              $text=[string]$node.text; $desc=[string]$node.'content-desc'; $rid=[string]$node.'resource-id'
+              if(($text -match $pattern)-or($desc -match $pattern)-or($rid -match $pattern)){
+                $bounds=[string]$node.bounds
+                if($bounds -match '\[(\d+),(\d+)\]\[(\d+),(\d+)\]'){
+                  $x=[int]((([int]$Matches[1])+([int]$Matches[3]))/2)
+                  $y=[int]((([int]$Matches[2])+([int]$Matches[4]))/2)
+                  & $adb shell input tap $x $y | Out-Null
+                  return $true
+                }
+              }
+            }
+            return $false
+          }
+
+          & $adb install -r -g C:\evermore-runtime\AuroraStore.apk 2>&1 | Tee-Object -FilePath artifacts\aurora-install.txt
+          if($LASTEXITCODE -ne 0){ throw 'Aurora Store did not install.' }
+          & $adb shell appops set $env:AURORA_PKG REQUEST_INSTALL_PACKAGES allow
+          & $adb shell appops set $env:AURORA_PKG RUN_IN_BACKGROUND allow
+          & $adb shell appops set $env:AURORA_PKG RUN_ANY_IN_BACKGROUND allow
+          & $adb shell dumpsys deviceidle whitelist +$env:AURORA_PKG
+          & $adb shell monkey -p $env:AURORA_PKG -c android.intent.category.LAUNCHER 1 2>&1 | Out-File artifacts\aurora-first-launch.txt
+          Start-Sleep 7
+          Snapshot '01-aurora-welcome'
+
+          for($i=0;$i -lt 40;$i++){
+            $xml=Dump-Ui
+            if($xml -match 'Anonymous'){break}
+            if(-not (Tap-Match 'Skip|Next|Finish|Continue|Accept|Agree|OK')){ & $adb shell input swipe 900 1200 200 1200 300 | Out-Null }
+            Start-Sleep 3
+          }
+          Snapshot '02-aurora-login'
+          if(-not (Tap-Match '^Anonymous$')){ & $adb shell input tap 540 1985 | Out-Null }
+          Start-Sleep 12
+
+          $loggedIn=$false
+          for($i=0;$i -lt 90;$i++){
+            $xml=Dump-Ui
+            $xml | Out-File artifacts\aurora-current.xml
+            if($xml -match 'Games|Apps|For you|Top charts|Categories|Updates|Search'){$loggedIn=$true;break}
+            [void](Tap-Match 'Continue|Proceed|Accept|Agree|OK|Retry|Try again|Anonymous')
+            if(($i%15)-eq 0){Snapshot "aurora-login-$i"}
+            Start-Sleep 4
+          }
+          "anonymous_login=$loggedIn" | Out-File artifacts\login-status.txt
+          Snapshot '03-aurora-after-login'
+
+          $installed=$false
+          if($loggedIn){
+            & $adb shell am start -W -a android.intent.action.VIEW -d "market://details?id=$env:PKG" -p $env:AURORA_PKG 2>&1 | Tee-Object -FilePath artifacts\aurora-evermore-deeplink.txt
+            Start-Sleep 15
+            Snapshot '04-evermore-listing'
+            for($i=0;$i -lt 210;$i++){
+              if(((& $adb shell pm path $env:PKG 2>$null)-match '^package:').Count -gt 0){$installed=$true;break}
+              [void](Tap-Match '^Install$|^Download$|^Get$|Install anyway|Continue|Allow from this source|Allow|OK|Done|Retry|Try again')
+              if(($i%15)-eq 0){Snapshot "install-progress-$i"}
+              Start-Sleep 4
+            }
+          }
+
+          & $adb shell pm path $env:PKG 2>&1 | Tee-Object -FilePath artifacts\package-paths.txt
+          $installed=(((& $adb shell pm path $env:PKG 2>$null)-match '^package:').Count -gt 0)
+          & $adb shell dumpsys package $env:PKG | Out-File artifacts\package-dump.txt
+          & $adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_CUSTOM 2>&1 | Out-File artifacts\custom-referral-handlers.txt
+          & $adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_HTTPS 2>&1 | Out-File artifacts\https-referral-handlers.txt
+
+          if($installed){
+            & $adb logcat -c
+            & $adb shell monkey -p $env:PKG -c android.intent.category.LAUNCHER 1 2>&1 | Out-File artifacts\first-launch.txt
+            Start-Sleep 20; Snapshot '05-evermore-first-launch-20s'; Start-Sleep 30; Snapshot '06-evermore-first-launch-50s'
+            & $adb shell am force-stop $env:PKG
+            & $adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_CUSTOM -p $env:PKG 2>&1 | Tee-Object -FilePath artifacts\custom-referral-launch.txt
+            Start-Sleep 15; Snapshot '07-custom-referral-15s'; Start-Sleep 30; Snapshot '08-custom-referral-45s'
+            & $adb shell am force-stop $env:PKG
+            & $adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_HTTPS -p $env:PKG 2>&1 | Tee-Object -FilePath artifacts\https-referral-launch.txt
+            Start-Sleep 15; Snapshot '09-https-referral-15s'
+          }
+
+          & $adb shell dumpsys activity activities | Out-File artifacts\activities.txt
+          & $adb shell dumpsys window windows | Out-File artifacts\windows.txt
+          & $adb logcat -d -v threadtime | Out-File artifacts\logcat.txt
+          $activityText=(& $adb shell dumpsys activity activities|Out-String)
+          $top=(($activityText -split "`n")|Where-Object{$_ -match 'mResumedActivity|topResumedActivity'}|Select-Object -First 1).Trim()
+          @("adb_ready=true","booted=true","installed=$installed","anonymous_login=$loggedIn","package=$env:PKG","custom_referral=$env:REFERRAL_CUSTOM","https_referral=$env:REFERRAL_HTTPS","guest_abilist=$((& $adb shell getprop ro.product.cpu.abilist).Trim())","native_bridge=$((& $adb shell getprop ro.dalvik.vm.native.bridge).Trim())","top_activity=$top")|Out-File artifacts\RESULT.txt
+          if(-not $installed){throw 'Evermore did not install through Aurora; inspect screenshots and controller evidence.'}
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-windows-aurora-v2-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
