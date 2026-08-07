@@ -1,0 +1,198 @@
+name: Evermore known XAPK macOS ARM64 referral proof
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  referral-proof:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      PKG: com.evermoregames.evermorearcade
+      VERSION: 0.1.64
+      REFERRAL_HTTPS: https://evermoregamesllc.com/referral?code=J32R6Q
+      REFERRAL_CUSTOM: evermorearcade://referral?code=J32R6Q
+      XAPK_URL: https://ztp-pew.apkcombo.com/xapk/com.evermoregames.evermorearcade/15c2243bf1a64f66ab786783b298256a/download?name=com.evermoregames.evermorearcade_0.1.64.xapk
+
+    steps:
+      - name: Download and inspect known Evermore XAPK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/evermore-xapk /tmp/evermore-apks
+          uname -a | tee artifacts/host.txt
+          sw_vers | tee -a artifacts/host.txt
+          printf 'ANDROID_HOME=%s\n' "${ANDROID_HOME:-}" | tee artifacts/runtime-selection.txt
+
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 2400 \
+            -A 'Mozilla/5.0' "$XAPK_URL" -o /tmp/Evermore.xapk
+          ls -lh /tmp/Evermore.xapk | tee artifacts/package-size.txt
+          shasum -a 256 /tmp/Evermore.xapk | tee artifacts/package-sha256.txt
+          file /tmp/Evermore.xapk | tee artifacts/package-filetype.txt
+          unzip -l /tmp/Evermore.xapk | tee artifacts/package-entries.txt
+          unzip -q /tmp/Evermore.xapk -d /tmp/evermore-xapk
+          find /tmp/evermore-xapk -type f -maxdepth 5 -print | sort | tee artifacts/extracted-files.txt
+          find /tmp/evermore-xapk -type f -name '*.apk' -exec cp '{}' /tmp/evermore-apks/ \;
+          find /tmp/evermore-apks -type f -name '*.apk' -print -exec ls -lh '{}' \; | tee artifacts/apk-files.txt
+          if ! find /tmp/evermore-apks -type f -name '*.apk' | grep -q .; then
+            echo 'No APK files found in XAPK' >&2
+            exit 2
+          fi
+          if [ -f /tmp/evermore-xapk/manifest.json ]; then
+            cp /tmp/evermore-xapk/manifest.json artifacts/xapk-manifest.json
+          fi
+
+          SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          SDKMANAGER="$(find "$SDK" -type f -name sdkmanager -perm +111 | head -1)"
+          AVDMANAGER="$(find "$SDK" -type f -name avdmanager -perm +111 | head -1)"
+          if [ -z "$SDKMANAGER" ] || [ -z "$AVDMANAGER" ]; then
+            echo 'Android command-line tools not found' >&2
+            exit 3
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" 'platform-tools' 'emulator' 'platforms;android-31' 'build-tools;35.0.0' 'system-images;android-31;google_apis;arm64-v8a' \
+            2>&1 | tee artifacts/sdk-install.txt
+          AAPT="$(find "$SDK/build-tools" -type f -name aapt -perm +111 | sort -V | tail -1)"
+          echo "aapt=$AAPT" | tee artifacts/aapt-path.txt
+          for apk in /tmp/evermore-apks/*.apk; do
+            echo "===== $(basename "$apk") =====" | tee -a artifacts/aapt-badging.txt
+            "$AAPT" dump badging "$apk" 2>&1 | tee -a artifacts/aapt-badging.txt || true
+            echo "===== $(basename "$apk") =====" | tee -a artifacts/manifest-xmltree.txt
+            "$AAPT" dump xmltree "$apk" AndroidManifest.xml 2>&1 | tee -a artifacts/manifest-xmltree.txt || true
+          done
+          printf 'no\n' | "$AVDMANAGER" create avd --force --name evermore --package 'system-images;android-31;google_apis;arm64-v8a' --device pixel_6 \
+            2>&1 | tee artifacts/avd-create.txt
+
+      - name: Boot Android, install Evermore, and open referral
+        shell: bash
+        run: |
+          set +e
+          SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          ADB="$SDK/platform-tools/adb"
+          EMULATOR="$SDK/emulator/emulator"
+          [ -x "$ADB" ] || ADB="$(find "$SDK" -type f -name adb -perm +111 | head -1)"
+          [ -x "$EMULATOR" ] || EMULATOR="$(find "$SDK" -type f -name emulator -perm +111 | head -1)"
+          printf 'adb=%s\nemulator=%s\n' "$ADB" "$EMULATOR" | tee artifacts/runtime-tools.txt
+
+          "$EMULATOR" @evermore -no-window -gpu swiftshader_indirect -no-snapshot -wipe-data -noaudio -no-boot-anim -no-metrics \
+            -memory 4096 -cores 4 -netdelay none -netspeed full \
+            >artifacts/emulator-stdout.txt 2>artifacts/emulator-stderr.txt &
+          EMUPID=$!
+          echo "pid=$EMUPID" > artifacts/emulator-pid.txt
+
+          READY=0
+          for i in $(seq 1 240); do
+            "$ADB" get-state >/dev/null 2>&1 && { READY=1; break; }
+            sleep 2
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo 'ADB device did not appear' | tee artifacts/RESULT.txt
+            tail -200 artifacts/emulator-stderr.txt > artifacts/emulator-stderr-tail.txt
+            exit 11
+          fi
+          BOOTED=0
+          for i in $(seq 1 360); do
+            [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && { BOOTED=1; break; }
+            sleep 2
+          done
+          if [ "$BOOTED" -ne 1 ]; then
+            echo 'Android did not finish booting' | tee artifacts/RESULT.txt
+            exit 12
+          fi
+
+          "$ADB" devices -l | tee artifacts/adb-devices.txt
+          "$ADB" shell getprop ro.build.version.release | tee artifacts/android-version.txt
+          "$ADB" shell getprop ro.product.cpu.abilist | tee artifacts/abilist.txt
+          "$ADB" shell getprop ro.dalvik.vm.native.bridge | tee artifacts/native-bridge.txt
+          "$ADB" shell settings put global window_animation_scale 0
+          "$ADB" shell settings put global transition_animation_scale 0
+          "$ADB" shell settings put global animator_duration_scale 0
+          "$ADB" shell settings put global package_verifier_enable 0
+          "$ADB" shell settings put global verifier_verify_adb_installs 0
+
+          APKS=(/tmp/evermore-apks/*.apk)
+          "$ADB" install-multiple -r -t -g "${APKS[@]}" 2>&1 | tee artifacts/install.txt
+          INSTALL_EXIT=${PIPESTATUS[0]}
+
+          if find /tmp/evermore-xapk -type f -path '*/Android/obb/*' | grep -q .; then
+            "$ADB" shell mkdir -p "/sdcard/Android/obb/$PKG"
+            find /tmp/evermore-xapk -type f -path '*/Android/obb/*' -print | tee artifacts/obb-files.txt | while read -r obb; do
+              "$ADB" push "$obb" "/sdcard/Android/obb/$PKG/$(basename "$obb")" 2>&1 | tee -a artifacts/obb-push.txt
+            done
+          fi
+          "$ADB" shell pm path "$PKG" 2>&1 | tee artifacts/package-paths.txt
+          if "$ADB" shell pm path "$PKG" | grep -q '^package:'; then INSTALLED=true; else INSTALLED=false; fi
+
+          snapshot() {
+            name="$1"
+            "$ADB" exec-out screencap -p > "artifacts/${name}.png"
+            "$ADB" shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1
+            "$ADB" pull /sdcard/window.xml "artifacts/${name}.xml" >/dev/null 2>&1
+            "$ADB" shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -2 > "artifacts/${name}-top.txt"
+          }
+
+          "$ADB" shell dumpsys package "$PKG" > artifacts/package-dump.txt 2>&1
+          "$ADB" shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_CUSTOM" \
+            > artifacts/custom-referral-handlers.txt 2>&1
+          "$ADB" shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" \
+            > artifacts/https-referral-handlers.txt 2>&1
+
+          if [ "$INSTALLED" = true ]; then
+            "$ADB" logcat -c
+            "$ADB" shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 > artifacts/first-launch.txt 2>&1
+            sleep 20
+            snapshot 01-first-launch-20s
+            sleep 30
+            snapshot 02-first-launch-50s
+
+            "$ADB" shell am force-stop "$PKG"
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_CUSTOM" -p "$PKG" \
+              2>&1 | tee artifacts/custom-referral.txt
+            sleep 15
+            snapshot 03-custom-referral-15s
+            sleep 25
+            snapshot 04-custom-referral-40s
+
+            "$ADB" shell am force-stop "$PKG"
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" -p "$PKG" \
+              2>&1 | tee artifacts/https-referral-app.txt
+            sleep 15
+            snapshot 05-https-referral-app-15s
+
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" \
+              2>&1 | tee artifacts/https-referral-generic.txt
+            sleep 15
+            snapshot 06-https-referral-generic-15s
+          fi
+
+          "$ADB" shell dumpsys activity activities > artifacts/activities.txt 2>&1
+          "$ADB" shell dumpsys window windows > artifacts/windows.txt 2>&1
+          "$ADB" logcat -d -v threadtime > artifacts/logcat.txt 2>&1
+          TOP="$("$ADB" shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -1)"
+          {
+            echo "installed=$INSTALLED"
+            echo "install_exit=$INSTALL_EXIT"
+            echo "package=$PKG"
+            echo "package_version=$VERSION"
+            echo "custom_referral=$REFERRAL_CUSTOM"
+            echo "https_referral=$REFERRAL_HTTPS"
+            echo "guest_abilist=$("$ADB" shell getprop ro.product.cpu.abilist | tr -d '\r')"
+            echo "native_bridge=$("$ADB" shell getprop ro.dalvik.vm.native.bridge | tr -d '\r')"
+            echo "top_activity=$TOP"
+          } | tee artifacts/RESULT.txt
+          [ "$INSTALLED" = true ] || exit 13
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-known-xapk-macos-arm64-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
