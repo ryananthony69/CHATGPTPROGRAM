@@ -3,3 +3,4 @@ Synchronize event retry after GitHub Actions returned to operational status.
 Retry requested after Actions queues recovered on 2026-08-07 UTC.
 Retry with direct APKCombo response saving and x86/ARM emulator matrix.
 Trigger ARM64 TCG probe using current APKCombo xid/checkin flow.
+Trigger QooApp API ARM64 probe as alternate package source.
