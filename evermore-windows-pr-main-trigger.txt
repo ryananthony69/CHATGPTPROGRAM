@@ -1,0 +1,2 @@
+Trigger the PR-based Evermore Windows software-emulator workflow for referral code J32R6Q.
+Retry after GitHub Actions recovery on 2026-08-07.
