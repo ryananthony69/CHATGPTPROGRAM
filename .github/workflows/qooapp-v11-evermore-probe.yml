@@ -1,0 +1,119 @@
+name: QooApp v11 Evermore direct probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/qooapp-v11-evermore-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PKG: com.evermoregames.evermorearcade
+    steps:
+      - name: Query exact current QooApp v11 download route
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p out
+          UUID='8c3f2e6d-712a-44c0-96f3-92ff52f054ef'
+          ANDROID_ID='b7e4d60fa1832c51'
+          DEVICE_ID='a3d7f89c0e564b12'
+          COMMON=(
+            --get
+            --data-urlencode 'type=app'
+            --data-urlencode "uuid=$UUID"
+            --data-urlencode 'X-Manufacturer=Google'
+            --data-urlencode 'X-Fingerprint=google/sdk_gphone64_arm64/emu64a:12/SE1A.220826.006/8918568:userdebug/dev-keys'
+            --data-urlencode 'oaid='
+            --data-urlencode 'package_id=com.qooapp.qoohelper'
+            --data-urlencode 'version_code=90400'
+            --data-urlencode 'os=android 12'
+            --data-urlencode 'device=emu64a'
+            --data-urlencode 'device_model=sdk_gphone64_arm64'
+            --data-urlencode "device_id=$DEVICE_ID"
+            --data-urlencode 'rooted=false'
+            --data-urlencode 'adid='
+            --data-urlencode "android_id=$ANDROID_ID"
+            --data-urlencode 'patch_code=48'
+            --data-urlencode 'version_name=9.4.0'
+            --data-urlencode 'supported_abis=arm64-v8a,armeabi-v7a'
+            --data-urlencode 'sdk_version=31'
+            --data-urlencode 'opengl=196610'
+            --data-urlencode 'screen=1080,2400'
+            --data-urlencode 'density=420'
+            --data-urlencode 'locale=en_US'
+            --data-urlencode 'system_locale=en-US'
+            --data-urlencode 'otome=0'
+            --data-urlencode "sa_distinct_id=$DEVICE_ID"
+          )
+          hosts=('https://api.qoo-app.com' 'https://api.ppaooq.com' 'https://api.qqaoop.com')
+          idx=0
+          for host in "${hosts[@]}"; do
+            for mode in minimal full; do
+              idx=$((idx+1))
+              url="$host/v11/apps/$PKG/download"
+              echo "=== $idx $mode $url ===" | tee -a out/summary.txt
+              args=(--location --silent --show-error --connect-timeout 20 --max-time 180 -A 'QooApp/9.4.0 (Android)' -D "out/$idx.headers")
+              if [ "$mode" = minimal ]; then
+                args+=(--get --data-urlencode 'type=app')
+              else
+                args+=("${COMMON[@]}")
+              fi
+              set +e
+              curl "${args[@]}" -o "out/$idx.body" \
+                -w 'http_code=%{http_code}\nurl_effective=%{url_effective}\ncontent_type=%{content_type}\nsize_download=%{size_download}\n' \
+                "$url" | tee "out/$idx.result"
+              rc=${PIPESTATUS[0]}
+              set -e
+              echo "curl_rc=$rc" | tee -a "out/$idx.result" out/summary.txt
+              cat "out/$idx.result" >> out/summary.txt
+              head -c 1000 "out/$idx.body" | strings | head -30 >> out/summary.txt || true
+              echo >> out/summary.txt
+            done
+          done
+
+          # Also query store metadata using both package and QooApp catalog id.
+          for ident in "$PKG" 150473; do
+            idx=$((idx+1))
+            url="https://api.qoo-app.com/store/v11/apps/$ident"
+            echo "=== $idx metadata $url ===" | tee -a out/summary.txt
+            set +e
+            curl --location --silent --show-error --connect-timeout 20 --max-time 180 \
+              -A 'QooApp/9.4.0 (Android)' -D "out/$idx.headers" -o "out/$idx.body" \
+              -w 'http_code=%{http_code}\nurl_effective=%{url_effective}\ncontent_type=%{content_type}\nsize_download=%{size_download}\n' \
+              --get \
+              --data-urlencode "uuid=$UUID" \
+              --data-urlencode 'package_id=com.qooapp.qoohelper' \
+              --data-urlencode 'version_code=90400' \
+              --data-urlencode 'version_name=9.4.0' \
+              --data-urlencode 'supported_abis=arm64-v8a,armeabi-v7a' \
+              --data-urlencode 'sdk_version=31' \
+              --data-urlencode 'locale=en_US' \
+              --data-urlencode 'system_locale=en-US' \
+              --data-urlencode "device_id=$DEVICE_ID" \
+              --data-urlencode "android_id=$ANDROID_ID" \
+              "$url" | tee "out/$idx.result"
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "curl_rc=$rc" | tee -a "out/$idx.result" out/summary.txt
+            cat "out/$idx.result" >> out/summary.txt
+            head -c 5000 "out/$idx.body" >> out/summary.txt || true
+            echo >> out/summary.txt
+          done
+
+          cat out/summary.txt
+
+      - name: Upload QooApp v11 responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qooapp-v11-evermore-probe
+          path: out
+          retention-days: 3
