@@ -1,0 +1,194 @@
+name: Evermore QooApp ARM64 referral probe
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 65
+    env:
+      PKG: com.evermoregames.evermorearcade
+      REFERRAL_HTTPS: https://evermoregamesllc.com/referral?code=J32R6Q
+      REFERRAL_CUSTOM: evermorearcade://referral?code=J32R6Q
+
+    steps:
+      - name: Download Evermore through QooApp API
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifacts, C:\evermore-apks | Out-Null
+          python -m pip install --disable-pip-version-check -q requests
+          @'
+          import binascii, json, os, pathlib, requests
+          pkg = os.environ['PKG']
+          version_str = '8.1.6'; version_code = 316
+          device = binascii.b2a_hex(os.urandom(8)).decode()
+          base_headers = {'User-Agent': f'QooApp {version_str}', 'Device-Id': device}
+          token = requests.post(
+              'https://api.qoo-app.com/v6/users', params={'version_code': version_code},
+              data={'device_id': device, 'platform_access_token': device, 'type': 4, 'email': 'null', 'version_code': version_code},
+              headers=base_headers, timeout=60)
+          pathlib.Path('artifacts/qoo-token-status.txt').write_text(f'status={token.status_code}\ndevice_id={device}\n', encoding='utf-8')
+          token.raise_for_status()
+          user_token = token.json()['token']
+          params = {'supported_abis': 'arm64-v8a,armeabi-v7a,armeabi', 'sdk_version': 31, 'version_code': version_code}
+          info = requests.get(f'https://api.qoo-app.com/v10/apps/{pkg}', params=params,
+                              headers={'X-User-Token': user_token, **base_headers}, timeout=60)
+          pathlib.Path('artifacts/qoo-info-status.txt').write_text(f'status={info.status_code}\nurl={info.url}\n', encoding='utf-8')
+          pathlib.Path('artifacts/qoo-info.json').write_text(info.text, encoding='utf-8', errors='ignore')
+          info.raise_for_status()
+          data = info.json().get('data') or {}
+          apk = data.get('apk') or {}
+          pathlib.Path('artifacts/qoo-summary.txt').write_text('\n'.join([
+              f"is_apk_ready={data.get('is_apk_ready')}",
+              f"version_name={apk.get('version_name')}",
+              f"version_code={apk.get('version_code')}",
+              f"dl_compatibility={apk.get('dl_compatibility')}",
+              f"data_pack_needed={apk.get('data_pack_needed')}",
+              f"obb={apk.get('obb') is not None}",
+              f"base_apk_md5={apk.get('base_apk_md5')}",
+          ]), encoding='utf-8')
+          dl_params = {**params, 'base_apk_version': 0}
+          with requests.get(f'https://api.qoo-app.com/v6/apps/{pkg}/download', params=dl_params,
+                            headers=base_headers, stream=True, timeout=120, allow_redirects=True) as r:
+              pathlib.Path('artifacts/qoo-download-status.txt').write_text(
+                  f'status={r.status_code}\nurl={r.url}\ncontent_type={r.headers.get("content-type")}\ncontent_length={r.headers.get("content-length")}\n', encoding='utf-8')
+              r.raise_for_status()
+              with open(r'C:\evermore-apks\base.apk','wb') as f:
+                  for chunk in r.iter_content(1024*1024):
+                      if chunk: f.write(chunk)
+          '@ | Set-Content -Encoding UTF8 $env:RUNNER_TEMP\qoo.py
+          python $env:RUNNER_TEMP\qoo.py 2>&1 | Tee-Object -FilePath artifacts\qoo-script.txt
+          if ($LASTEXITCODE -ne 0) { throw 'QooApp API/download failed.' }
+          $apk = 'C:\evermore-apks\base.apk'
+          Get-Item $apk | Select-Object FullName,Length | Format-List | Out-File artifacts\package-size.txt
+          Get-FileHash $apk -Algorithm SHA256 | Format-List | Out-File artifacts\package-sha256.txt
+          $bytes = Get-Content -Path $apk -Encoding Byte -TotalCount 2
+          if ($bytes.Count -ne 2 -or $bytes[0] -ne 0x50 -or $bytes[1] -ne 0x4B) { throw 'QooApp payload is not an APK.' }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead($apk)
+          $abis = [System.Collections.Generic.HashSet[string]]::new()
+          foreach ($entry in $z.Entries) { if ($entry.FullName -match '^lib/([^/]+)/') { [void]$abis.Add($Matches[1]) } }
+          $z.Dispose()
+          "package_native_abis=$([string]::Join(',', @($abis)))" | Out-File artifacts\package-abis.txt
+
+      - name: Prepare ARM64 Android 12 software emulator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter sdkmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          $avdManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter avdmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          cmd /c "echo y|`"$sdkManager`" --licenses" | Out-File artifacts\licenses.txt
+          $image = 'system-images;android-31;google_apis;arm64-v8a'
+          & $sdkManager 'platform-tools' 'platforms;android-31' 'build-tools;35.0.0' $image 2>&1 | Tee-Object -FilePath artifacts\sdk-install.txt
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 API31 system image install failed.' }
+          cmd /c "echo no|`"$avdManager`" create avd --force --name evermore-arm --package $image --device pixel_6" 2>&1 | Tee-Object -FilePath artifacts\avd-create.txt
+          if ($LASTEXITCODE -ne 0) { throw 'AVD creation failed.' }
+
+          $emuZip = 'C:\emulator-34.2.16.zip'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://dl.google.com/android/repository/emulator-windows_x64-12038310.zip' -OutFile $emuZip
+          $old = Join-Path $env:ANDROID_HOME 'emulator'
+          if (Test-Path ($old + '.runner')) { Remove-Item ($old + '.runner') -Recurse -Force }
+          if (Test-Path $old) { Rename-Item $old ($old + '.runner') }
+          Expand-Archive -Path $emuZip -DestinationPath $env:ANDROID_HOME -Force
+          $emulator = Join-Path $env:ANDROID_HOME 'emulator\emulator.exe'
+          & $emulator -version 2>&1 | Tee-Object -FilePath artifacts\emulator-version.txt
+
+          $aapt = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter aapt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          & $aapt dump badging C:\evermore-apks\base.apk 2>&1 | Out-File artifacts\aapt-badging.txt
+          & $aapt dump xmltree C:\evermore-apks\base.apk AndroidManifest.xml 2>&1 | Out-File artifacts\manifest-xmltree.txt
+
+      - name: Boot, install, and test referral intents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $adb = Join-Path $env:ANDROID_HOME 'platform-tools\adb.exe'
+          $emulator = Join-Path $env:ANDROID_HOME 'emulator\emulator.exe'
+          & $adb kill-server | Out-Null
+          $args = @('@evermore-arm','-no-window','-gpu','swiftshader_indirect','-no-snapshot','-wipe-data','-noaudio','-no-boot-anim','-accel','off','-memory','3072','-cores','2','-netdelay','none','-netspeed','full','-qemu','-machine','virt')
+          $proc = Start-Process -FilePath $emulator -ArgumentList $args -RedirectStandardOutput artifacts\emulator-stdout.txt -RedirectStandardError artifacts\emulator-stderr.txt -PassThru
+          "pid=$($proc.Id)" | Out-File artifacts\emulator-pid.txt
+          $ready = $false
+          for ($i=0; $i -lt 500; $i++) {
+            & $adb get-state 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            if ($proc.HasExited) { break }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $ready) {
+            "adb_ready=false`nemulator_exited=$($proc.HasExited)`nexit_code=$(if($proc.HasExited){$proc.ExitCode}else{'running'})" | Out-File artifacts\RESULT.txt
+            throw 'ADB device did not appear.'
+          }
+          $booted = $false
+          for ($i=0; $i -lt 400; $i++) {
+            if ((& $adb shell getprop sys.boot_completed 2>$null).Trim() -eq '1') { $booted = $true; break }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $booted) { "adb_ready=true`nbooted=false" | Out-File artifacts\RESULT.txt; throw 'Android did not finish booting.' }
+          & $adb devices -l | Out-File artifacts\adb-devices.txt
+          & $adb shell getprop ro.product.cpu.abilist | Out-File artifacts\guest-abilist.txt
+          & $adb shell uname -m | Out-File artifacts\guest-uname.txt
+          & $adb shell settings put global window_animation_scale 0
+          & $adb shell settings put global transition_animation_scale 0
+          & $adb shell settings put global animator_duration_scale 0
+
+          & $adb install -r -t -g C:\evermore-apks\base.apk 2>&1 | Tee-Object -FilePath artifacts\install.txt
+          $installExit = $LASTEXITCODE
+          $installed = ((& $adb shell pm path $env:PKG) -match '^package:').Count -gt 0
+          & $adb shell dumpsys package $env:PKG | Out-File artifacts\package-dump.txt
+          & $adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_CUSTOM 2>&1 | Out-File artifacts\custom-referral-handlers.txt
+          & $adb shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_HTTPS 2>&1 | Out-File artifacts\https-referral-handlers.txt
+
+          function Snapshot([string]$name) {
+            cmd /c "`"$adb`" exec-out screencap -p > artifacts\$name.png"
+            & $adb shell uiautomator dump /sdcard/window.xml | Out-Null
+            & $adb pull /sdcard/window.xml "artifacts\$name.xml" | Out-Null
+            & $adb shell dumpsys activity activities | Out-File "artifacts\$name-activities.txt"
+            & $adb shell dumpsys window windows | Out-File "artifacts\$name-windows.txt"
+          }
+          if ($installed) {
+            & $adb logcat -c
+            & $adb shell monkey -p $env:PKG -c android.intent.category.LAUNCHER 1 2>&1 | Tee-Object -FilePath artifacts\first-launch.txt
+            Start-Sleep -Seconds 25
+            Snapshot '01-first-launch'
+            & $adb shell am force-stop $env:PKG
+            & $adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_CUSTOM -p $env:PKG 2>&1 | Tee-Object -FilePath artifacts\custom-referral.txt
+            Start-Sleep -Seconds 20
+            Snapshot '02-custom-referral'
+            & $adb shell am force-stop $env:PKG
+            & $adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_HTTPS -p $env:PKG 2>&1 | Tee-Object -FilePath artifacts\https-referral-app.txt
+            Start-Sleep -Seconds 20
+            Snapshot '03-https-referral-app'
+            & $adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d $env:REFERRAL_HTTPS 2>&1 | Tee-Object -FilePath artifacts\https-referral-generic.txt
+            Start-Sleep -Seconds 20
+            Snapshot '04-https-referral-generic'
+          }
+          & $adb logcat -d -v threadtime | Out-File artifacts\logcat.txt
+          $top = ((& $adb shell dumpsys activity activities) | Select-String 'mResumedActivity|topResumedActivity' | Select-Object -First 1).ToString()
+          @(
+            "adb_ready=true",
+            "booted=true",
+            "installed=$installed",
+            "install_exit=$installExit",
+            "guest_abi=$((& $adb shell getprop ro.product.cpu.abilist).Trim())",
+            "guest_uname=$((& $adb shell uname -m).Trim())",
+            "top_activity=$top"
+          ) | Out-File artifacts\RESULT.txt
+          if (-not $installed) { throw 'Evermore package did not install.' }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-qooapp-arm64-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
