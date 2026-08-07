@@ -1,0 +1,66 @@
+name: Evermore QooApp native ARM64
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/evermore-qooapp-arm64.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evermore-qooapp-native-arm64
+  cancel-in-progress: true
+
+jobs:
+  open-referral:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      QOOAPP_APK_URL: https://d.qoo-apk.com/880/apk/com.qooapp.qoohelper-20260708152301.apk
+    steps:
+      - name: Check out controller
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download current QooApp 9.4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/qooapp
+          printf 'host=%s\narch=%s\n' "$(sw_vers -productVersion)" "$(uname -m)" | tee artifacts/host.txt
+          test "$(uname -m)" = arm64
+          curl --fail --location --retry 6 --retry-all-errors --connect-timeout 30 --max-time 600 \
+            "$QOOAPP_APK_URL" -o /tmp/qooapp/QooApp.apk
+          test "$(head -c 2 /tmp/qooapp/QooApp.apk)" = 'PK'
+          unzip -tq /tmp/qooapp/QooApp.apk >/dev/null
+          shasum -a 256 /tmp/qooapp/QooApp.apk | tee artifacts/qooapp-sha256.txt
+          ls -lh /tmp/qooapp/QooApp.apk | tee artifacts/qooapp-size.txt
+
+      - name: Boot native ARM64 Android and run Evermore path
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: arm64-v8a
+          profile: pixel_6
+          cores: 4
+          ram-size: 4096M
+          heap-size: 512M
+          disk-size: 12288M
+          emulator-boot-timeout: 900
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash .github/evermore/qooapp-ubuntu-fast.sh
+
+      - name: Upload ARM64 proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-qooapp-arm64-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
