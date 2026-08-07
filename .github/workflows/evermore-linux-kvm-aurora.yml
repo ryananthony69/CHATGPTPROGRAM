@@ -1,0 +1,50 @@
+name: Evermore Linux KVM Aurora referral probe
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+    paths:
+      - 'EVERMORE_LINUX_TRIGGER.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -l /dev/kvm || true
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+
+      - name: Run Android and inspect Evermore referral
+        uses: ReactiveCircus/android-emulator-runner@v2
+        with:
+          api-level: 31
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 4096M
+          heap-size: 512M
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none -no-snapshot -netdelay none -netspeed full
+          script: bash scripts/evermore_linux_aurora_probe.sh
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-linux-kvm-aurora-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
