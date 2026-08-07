@@ -1,0 +1,190 @@
+name: Evermore APKCombo token macOS ARM64 referral proof
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  referral-proof:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      PKG: com.evermoregames.evermorearcade
+      VERSION: 0.1.64
+      REFERRAL_HTTPS: https://evermoregamesllc.com/referral?code=J32R6Q
+      REFERRAL_CUSTOM: evermorearcade://referral?code=J32R6Q
+      ENCODED_URL: aHR0cHM6Ly96dHAtcGV3LmFwa2NvbWJvLmNvbS94YXBrL2NvbS5ldmVybW9yZWdhbWVzLmV2ZXJtb3JlYXJjYWRlLzE1YzIyNDNiZjFhNjRmNjZhYjc4Njc4M2IyOTgyNTZhL2Rvd25sb2FkP25hbWU9Y29tLmV2ZXJtb3JlZ2FtZXMuZXZlcm1vcmVhcmNhZGVfMC4xLjY0LnhhcGs=
+
+    steps:
+      - name: Resolve APKCombo token and download XAPK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts /tmp/evermore-xapk /tmp/evermore-apks
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36'
+          PAGE="https://apkcombo.com/evermore-arcade-win-cash/$PKG/download/apk"
+          DIRECT="$(python3 - <<'PY'
+          import base64, os
+          print(base64.b64decode(os.environ['ENCODED_URL']).decode())
+          PY
+          )"
+          CHECKIN="$(curl -fsSL -A "$UA" 'https://apkcombo.app/checkin' || true)"
+          printf 'checkin=%s\ndirect=%s\n' "$CHECKIN" "$DIRECT" | tee artifacts/resolution.txt
+          if [ -z "$CHECKIN" ]; then
+            echo 'APKCombo check-in returned no token' >&2
+            exit 2
+          fi
+
+          CANDIDATES=(
+            "$DIRECT&$CHECKIN&package_name=$PKG&lang=en"
+            "https://apkcombo.app/d?u=$ENCODED_URL&$CHECKIN&package_name=$PKG&lang=en"
+            "https://apkcombo.com/d?u=$ENCODED_URL&$CHECKIN&package_name=$PKG&lang=en"
+          )
+          OK=0
+          N=0
+          for URL in "${CANDIDATES[@]}"; do
+            N=$((N+1))
+            OUT="/tmp/candidate-$N.bin"
+            curl -sS -L --retry 2 --retry-all-errors --connect-timeout 30 --max-time 2400 \
+              -A "$UA" -e "$PAGE" -D "artifacts/candidate-$N-headers.txt" "$URL" -o "$OUT" || true
+            BYTES="$(wc -c < "$OUT" 2>/dev/null || echo 0)"
+            TYPE="$(file -b "$OUT" 2>/dev/null || true)"
+            printf 'candidate=%s\nbytes=%s\ntype=%s\nurl=%s\n' "$N" "$BYTES" "$TYPE" "$URL" > "artifacts/candidate-$N-summary.txt"
+            head -c 2 "$OUT" > "artifacts/candidate-$N-magic.bin" 2>/dev/null || true
+            if python3 - "$OUT" <<'PY'
+          import sys
+          p=sys.argv[1]
+          try:
+              with open(p,'rb') as f: ok=f.read(2)==b'PK'
+          except OSError: ok=False
+          raise SystemExit(0 if ok else 1)
+          PY
+            then
+              mv "$OUT" /tmp/Evermore.xapk
+              echo "$N" > artifacts/selected-candidate.txt
+              OK=1
+              break
+            else
+              head -c 12000 "$OUT" > "artifacts/candidate-$N-body-prefix.txt" 2>/dev/null || true
+            fi
+          done
+          if [ "$OK" -ne 1 ]; then
+            echo 'No APKCombo candidate returned a ZIP/XAPK payload' | tee artifacts/RESULT.txt
+            exit 3
+          fi
+
+          ls -lh /tmp/Evermore.xapk | tee artifacts/package-size.txt
+          shasum -a 256 /tmp/Evermore.xapk | tee artifacts/package-sha256.txt
+          unzip -l /tmp/Evermore.xapk | tee artifacts/package-entries.txt
+          unzip -q /tmp/Evermore.xapk -d /tmp/evermore-xapk
+          find /tmp/evermore-xapk -type f -name '*.apk' -exec cp '{}' /tmp/evermore-apks/ \;
+          find /tmp/evermore-apks -type f -name '*.apk' -print -exec ls -lh '{}' \; | tee artifacts/apk-files.txt
+          find /tmp/evermore-apks -type f -name '*.apk' | grep -q . || { echo 'No APKs extracted' >&2; exit 4; }
+          [ ! -f /tmp/evermore-xapk/manifest.json ] || cp /tmp/evermore-xapk/manifest.json artifacts/xapk-manifest.json
+
+          SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          SDKMANAGER="$(find "$SDK" -type f -name sdkmanager -perm +111 | head -1)"
+          AVDMANAGER="$(find "$SDK" -type f -name avdmanager -perm +111 | head -1)"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" 'platform-tools' 'emulator' 'platforms;android-31' 'build-tools;35.0.0' 'system-images;android-31;google_apis;arm64-v8a' \
+            2>&1 | tee artifacts/sdk-install.txt
+          AAPT="$(find "$SDK/build-tools" -type f -name aapt -perm +111 | sort -V | tail -1)"
+          for APK in /tmp/evermore-apks/*.apk; do
+            echo "===== $(basename "$APK") =====" >> artifacts/aapt-badging.txt
+            "$AAPT" dump badging "$APK" >> artifacts/aapt-badging.txt 2>&1 || true
+            echo "===== $(basename "$APK") =====" >> artifacts/manifest-xmltree.txt
+            "$AAPT" dump xmltree "$APK" AndroidManifest.xml >> artifacts/manifest-xmltree.txt 2>&1 || true
+          done
+          printf 'no\n' | "$AVDMANAGER" create avd --force --name evermore --package 'system-images;android-31;google_apis;arm64-v8a' --device pixel_6 \
+            2>&1 | tee artifacts/avd-create.txt
+
+      - name: Boot, install, launch, and test referral
+        shell: bash
+        run: |
+          set +e
+          SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          ADB="$SDK/platform-tools/adb"
+          EMULATOR="$SDK/emulator/emulator"
+          "$EMULATOR" @evermore -no-window -gpu swiftshader_indirect -no-snapshot -wipe-data -noaudio -no-boot-anim -no-metrics \
+            -memory 4096 -cores 4 -netdelay none -netspeed full >artifacts/emulator-stdout.txt 2>artifacts/emulator-stderr.txt &
+          echo "pid=$!" > artifacts/emulator-pid.txt
+
+          READY=0
+          for i in $(seq 1 240); do "$ADB" get-state >/dev/null 2>&1 && { READY=1; break; }; sleep 2; done
+          if [ "$READY" -ne 1 ]; then echo 'ADB device did not appear' | tee artifacts/RESULT.txt; exit 11; fi
+          BOOTED=0
+          for i in $(seq 1 360); do [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && { BOOTED=1; break; }; sleep 2; done
+          if [ "$BOOTED" -ne 1 ]; then echo 'Android did not finish booting' | tee artifacts/RESULT.txt; exit 12; fi
+
+          "$ADB" devices -l | tee artifacts/adb-devices.txt
+          "$ADB" shell getprop ro.product.cpu.abilist | tee artifacts/abilist.txt
+          APKS=(/tmp/evermore-apks/*.apk)
+          "$ADB" install-multiple -r -t -g "${APKS[@]}" 2>&1 | tee artifacts/install.txt
+          INSTALL_EXIT=${PIPESTATUS[0]}
+          "$ADB" shell pm path "$PKG" 2>&1 | tee artifacts/package-paths.txt
+          if "$ADB" shell pm path "$PKG" | grep -q '^package:'; then INSTALLED=true; else INSTALLED=false; fi
+
+          if find /tmp/evermore-xapk -type f -iname '*.obb' | grep -q .; then
+            "$ADB" shell mkdir -p "/sdcard/Android/obb/$PKG"
+            find /tmp/evermore-xapk -type f -iname '*.obb' | while read -r OBB; do "$ADB" push "$OBB" "/sdcard/Android/obb/$PKG/$(basename "$OBB")"; done > artifacts/obb-push.txt 2>&1
+          fi
+
+          snapshot() {
+            NAME="$1"
+            "$ADB" exec-out screencap -p > "artifacts/$NAME.png"
+            "$ADB" shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1
+            "$ADB" pull /sdcard/window.xml "artifacts/$NAME.xml" >/dev/null 2>&1
+            "$ADB" shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -3 > "artifacts/$NAME-top.txt"
+          }
+
+          "$ADB" shell dumpsys package "$PKG" > artifacts/package-dump.txt 2>&1
+          "$ADB" shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_CUSTOM" > artifacts/custom-referral-handlers.txt 2>&1
+          "$ADB" shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" > artifacts/https-referral-handlers.txt 2>&1
+
+          if [ "$INSTALLED" = true ]; then
+            "$ADB" logcat -c
+            "$ADB" shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 > artifacts/first-launch.txt 2>&1
+            sleep 20; snapshot 01-first-launch-20s
+            sleep 30; snapshot 02-first-launch-50s
+
+            "$ADB" shell am force-stop "$PKG"
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_CUSTOM" -p "$PKG" 2>&1 | tee artifacts/custom-referral.txt
+            sleep 15; snapshot 03-custom-referral-15s
+            sleep 25; snapshot 04-custom-referral-40s
+
+            "$ADB" shell am force-stop "$PKG"
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" -p "$PKG" 2>&1 | tee artifacts/https-referral-app.txt
+            sleep 15; snapshot 05-https-referral-app-15s
+
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" 2>&1 | tee artifacts/https-referral-generic.txt
+            sleep 15; snapshot 06-https-referral-generic-15s
+          fi
+
+          "$ADB" shell dumpsys activity activities > artifacts/activities.txt 2>&1
+          "$ADB" shell dumpsys window windows > artifacts/windows.txt 2>&1
+          "$ADB" logcat -d -v threadtime > artifacts/logcat.txt 2>&1
+          TOP="$("$ADB" shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -1)"
+          {
+            echo "installed=$INSTALLED"
+            echo "install_exit=$INSTALL_EXIT"
+            echo "package=$PKG"
+            echo "package_version=$VERSION"
+            echo "custom_referral=$REFERRAL_CUSTOM"
+            echo "https_referral=$REFERRAL_HTTPS"
+            echo "top_activity=$TOP"
+          } | tee artifacts/RESULT.txt
+          [ "$INSTALLED" = true ] || exit 13
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-apkcombo-token-macos-arm64-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
