@@ -1,0 +1,72 @@
+name: Evermore BunAPK current Aurora UA test
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      PKG: com.evermoregames.evermorearcade
+    steps:
+      - name: Patch BunAPK auth UA and download Evermore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifacts, C:\EvermoreOut, C:\evermore-apks | Out-Null
+          python -m pip install --disable-pip-version-check -q 'git+https://github.com/UltraMotionOfficial/BunAPK.git'
+          $authPath = python -c "import bunapk.auth; print(bunapk.auth.__file__)"
+          "auth_path=$authPath" | Out-File artifacts\bunapk-auth-path.txt
+          $src = Get-Content $authPath -Raw
+          $src = $src.Replace('com.aurora.store-4.6.1-70','com.aurora.store-4.8.4-76')
+          Set-Content -Path $authPath -Value $src -Encoding UTF8
+          Select-String -Path $authPath -Pattern 'com.aurora.store-' | Out-File artifacts\patched-ua.txt
+
+          bunapk info $env:PKG 2>&1 | Tee-Object -FilePath artifacts\bunapk-info.txt
+          if ($LASTEXITCODE -ne 0) { throw 'BunAPK info failed with current Aurora UA.' }
+          bunapk $env:PKG -o 'C:\EvermoreOut' 2>&1 | Tee-Object -FilePath artifacts\bunapk-download.txt
+          if ($LASTEXITCODE -ne 0) { throw 'BunAPK download failed with current Aurora UA.' }
+          Get-ChildItem C:\EvermoreOut -Recurse -File | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Out-File artifacts\downloaded-files.txt
+
+          $bundle = Get-ChildItem C:\EvermoreOut -Recurse -File -Filter *.apks | Sort-Object Length -Descending | Select-Object -First 1
+          if ($bundle) {
+            Expand-Archive -Path $bundle.FullName -DestinationPath C:\evermore-apks -Force
+            Get-FileHash $bundle.FullName -Algorithm SHA256 | Format-List | Out-File artifacts\bundle-sha256.txt
+            Get-Item $bundle.FullName | Select-Object FullName,Length | Format-List | Out-File artifacts\bundle-size.txt
+          } else {
+            $single = Get-ChildItem C:\EvermoreOut -Recurse -File -Filter *.apk | Sort-Object Length -Descending | Select-Object -First 1
+            if (-not $single) { throw 'No BunAPK output package found.' }
+            Copy-Item $single.FullName C:\evermore-apks\base.apk -Force
+          }
+          $apks = @(Get-ChildItem C:\evermore-apks -Recurse -File -Filter *.apk)
+          $apks | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Out-File artifacts\apk-files.txt
+
+          $aapt = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter aapt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $aapt) {
+            $sdkManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter sdkmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            & $sdkManager 'build-tools;35.0.0' | Out-Null
+            $aapt = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter aapt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          foreach ($apk in $apks) {
+            "===== $($apk.Name) =====" | Out-File artifacts\aapt-badging.txt -Append
+            & $aapt dump badging $apk.FullName 2>&1 | Out-File artifacts\aapt-badging.txt -Append
+            if ($apk.Name -match 'base|universal' -or $apks.Count -eq 1) {
+              & $aapt dump xmltree $apk.FullName AndroidManifest.xml 2>&1 | Out-File artifacts\manifest-xmltree.txt -Append
+            }
+          }
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-bunapk-currentua-test
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
