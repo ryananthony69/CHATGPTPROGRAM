@@ -1,0 +1,109 @@
+name: QooApp current API probe
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      PKG: com.evermoregames.evermorearcade
+    steps:
+      - name: Inspect current QooApp and call its API
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $qoo = Join-Path $env:RUNNER_TEMP 'QooApp.apk'
+          & curl.exe -L --fail --retry 5 --retry-all-errors 'https://d.qoo-apk.com/QooApp.apk' -o $qoo
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download official QooApp APK.' }
+          Get-Item $qoo | Select-Object FullName,Length | Format-List | Out-File artifacts\qooapp-size.txt
+          Get-FileHash $qoo -Algorithm SHA256 | Format-List | Out-File artifacts\qooapp-sha256.txt
+
+          $aapt = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter aapt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $aapt) {
+            $sdkManager = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter sdkmanager.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            & $sdkManager 'build-tools;35.0.0' | Out-File artifacts\sdk-install.txt
+            $aapt = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter aapt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          $badging = (& $aapt dump badging $qoo 2>&1 | Out-String)
+          $badging | Out-File artifacts\qooapp-badging.txt
+          if ($badging -notmatch "versionCode='([^']+)'\s+versionName='([^']+)'" ) { throw 'Could not parse QooApp version metadata.' }
+          $versionCode = $Matches[1]
+          $versionName = $Matches[2]
+          "version_code=$versionCode`nversion_name=$versionName" | Out-File artifacts\qooapp-version.txt
+          $env:QOO_VERSION_CODE = $versionCode
+          $env:QOO_VERSION_NAME = $versionName
+
+          python -m pip install --disable-pip-version-check -q requests
+          @'
+          import binascii, json, os, pathlib, requests
+          pkg = os.environ['PKG']
+          version_code = int(os.environ['QOO_VERSION_CODE'])
+          version_name = os.environ['QOO_VERSION_NAME']
+          device = binascii.b2a_hex(os.urandom(8)).decode()
+          headers = {'User-Agent': f'QooApp {version_name}', 'Device-Id': device}
+          token = requests.post('https://api.qoo-app.com/v6/users', params={'version_code': version_code},
+              data={'device_id': device, 'platform_access_token': device, 'type': 4, 'email': 'null', 'version_code': version_code},
+              headers=headers, timeout=60)
+          pathlib.Path('artifacts/token-status.txt').write_text(f'status={token.status_code}\nurl={token.url}\n', encoding='utf-8')
+          pathlib.Path('artifacts/token-body.txt').write_text(token.text, encoding='utf-8', errors='ignore')
+          if token.status_code >= 400:
+              raise RuntimeError(f'token status {token.status_code}: {token.text[:1000]}')
+          user_token = token.json()['token']
+          params = {'supported_abis':'arm64-v8a,armeabi-v7a,armeabi','sdk_version':31,'version_code':version_code}
+          info = requests.get(f'https://api.qoo-app.com/v10/apps/{pkg}', params=params, headers={'X-User-Token':user_token, **headers}, timeout=60)
+          pathlib.Path('artifacts/info-status.txt').write_text(f'status={info.status_code}\nurl={info.url}\n', encoding='utf-8')
+          pathlib.Path('artifacts/info-body.json').write_text(info.text, encoding='utf-8', errors='ignore')
+          info.raise_for_status()
+          data = info.json().get('data') or {}
+          apk = data.get('apk') or {}
+          pathlib.Path('artifacts/info-summary.txt').write_text('\n'.join([
+              f"id={data.get('id')}", f"is_apk_ready={data.get('is_apk_ready')}",
+              f"version_name={apk.get('version_name')}", f"version_code={apk.get('version_code')}",
+              f"dl_compatibility={apk.get('dl_compatibility')}", f"data_pack_needed={apk.get('data_pack_needed')}",
+              f"obb={apk.get('obb') is not None}", f"base_apk_md5={apk.get('base_apk_md5')}",
+          ]), encoding='utf-8')
+
+          dl = requests.get(f'https://api.qoo-app.com/v6/apps/{pkg}/download',
+              params={**params,'base_apk_version':0}, headers=headers, stream=True, timeout=120, allow_redirects=True)
+          pathlib.Path('artifacts/download-status.txt').write_text(f'status={dl.status_code}\nurl={dl.url}\ncontent_type={dl.headers.get("content-type")}\ncontent_length={dl.headers.get("content-length")}\n', encoding='utf-8')
+          if dl.status_code < 400:
+              with open('artifacts/Evermore.apk','wb') as f:
+                  for chunk in dl.iter_content(1024*1024):
+                      if chunk: f.write(chunk)
+          else:
+              pathlib.Path('artifacts/download-body.txt').write_text(dl.text[:5000], encoding='utf-8', errors='ignore')
+              dl.raise_for_status()
+          '@ | Set-Content -Encoding UTF8 $env:RUNNER_TEMP\qoo-current.py
+          python $env:RUNNER_TEMP\qoo-current.py 2>&1 | Tee-Object -FilePath artifacts\probe-log.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Current QooApp API probe failed.' }
+
+      - name: Inspect Evermore package if downloaded
+        if: always()
+        shell: pwsh
+        run: |
+          $apk = 'artifacts\Evermore.apk'
+          if (Test-Path $apk) {
+            Get-Item $apk | Select-Object Length | Format-List | Out-File artifacts\evermore-size.txt
+            Get-FileHash $apk -Algorithm SHA256 | Format-List | Out-File artifacts\evermore-sha256.txt
+            $aapt = Get-ChildItem $env:ANDROID_HOME -Recurse -Filter aapt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+            & $aapt dump badging $apk 2>&1 | Out-File artifacts\evermore-badging.txt
+            & $aapt dump xmltree $apk AndroidManifest.xml 2>&1 | Out-File artifacts\evermore-manifest.txt
+          }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qooapp-current-api-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
