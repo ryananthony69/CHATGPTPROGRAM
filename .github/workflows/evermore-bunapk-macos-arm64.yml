@@ -1,0 +1,191 @@
+name: Evermore BunAPK macOS ARM64 referral probe
+
+on:
+  pull_request:
+    branches:
+      - evermore-windows-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 65
+    env:
+      PKG: com.evermoregames.evermorearcade
+      REFERRAL_HTTPS: https://evermoregamesllc.com/referral?code=J32R6Q
+      REFERRAL_CUSTOM: evermorearcade://referral?code=J32R6Q
+
+    steps:
+      - name: Download Evermore from Google Play with current Aurora UA
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts "$RUNNER_TEMP/EvermoreOut" "$RUNNER_TEMP/evermore-apks"
+          uname -a | tee artifacts/host.txt
+          sysctl -n machdep.cpu.brand_string 2>/dev/null | tee -a artifacts/host.txt || true
+          python3 -m pip install --disable-pip-version-check -q 'git+https://github.com/UltraMotionOfficial/BunAPK.git'
+          AUTH_PATH=$(python3 -c 'import bunapk.auth; print(bunapk.auth.__file__)')
+          echo "auth_path=$AUTH_PATH" | tee artifacts/bunapk-auth-path.txt
+          python3 - "$AUTH_PATH" <<'PY'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1]); s=p.read_text()
+          s=s.replace('com.aurora.store-4.6.1-70','com.aurora.store-4.8.4-76')
+          p.write_text(s)
+          PY
+          grep 'com.aurora.store-' "$AUTH_PATH" | tee artifacts/patched-ua.txt || true
+          bunapk info "$PKG" 2>&1 | tee artifacts/bunapk-info.txt
+          bunapk "$PKG" -o "$RUNNER_TEMP/EvermoreOut" 2>&1 | tee artifacts/bunapk-download.txt
+          find "$RUNNER_TEMP/EvermoreOut" -type f -maxdepth 5 -print0 | xargs -0 ls -lh | tee artifacts/downloaded-files.txt
+          BUNDLE=$(find "$RUNNER_TEMP/EvermoreOut" -type f -name '*.apks' -print | head -n1 || true)
+          if [ -n "$BUNDLE" ]; then
+            ditto -x -k "$BUNDLE" "$RUNNER_TEMP/evermore-apks"
+            shasum -a 256 "$BUNDLE" | tee artifacts/bundle-sha256.txt
+            ls -lh "$BUNDLE" | tee artifacts/bundle-size.txt
+          else
+            SINGLE=$(find "$RUNNER_TEMP/EvermoreOut" -type f -name '*.apk' -print | head -n1 || true)
+            [ -n "$SINGLE" ] || { echo 'No APK/APKS output from BunAPK'; exit 2; }
+            cp "$SINGLE" "$RUNNER_TEMP/evermore-apks/base.apk"
+          fi
+          find "$RUNNER_TEMP/evermore-apks" -type f -name '*.apk' -print | sort | tee artifacts/apk-files.txt
+          python3 - "$RUNNER_TEMP/evermore-apks" <<'PY' > artifacts/package-abis.txt
+          import pathlib,re,sys,zipfile
+          abis=set()
+          for p in pathlib.Path(sys.argv[1]).rglob('*.apk'):
+              try:
+                  with zipfile.ZipFile(p) as z:
+                      for n in z.namelist():
+                          m=re.match(r'lib/([^/]+)/',n)
+                          if m: abis.add(m.group(1))
+              except Exception: pass
+          print('package_native_abis='+','.join(sorted(abis)))
+          PY
+
+      - name: Prepare Android 12 ARM64 emulator and inspect manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SDKMANAGER=$(find "$ANDROID_HOME" -type f -name sdkmanager | head -n1)
+          AVDMANAGER=$(find "$ANDROID_HOME" -type f -name avdmanager | head -n1)
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platform-tools' 'platforms;android-31' 'build-tools;35.0.0' 'system-images;android-31;google_apis;arm64-v8a' 2>&1 | tee artifacts/sdk-install.txt
+          echo no | "$AVDMANAGER" create avd --force --name evermore-arm --package 'system-images;android-31;google_apis;arm64-v8a' --device pixel_6 2>&1 | tee artifacts/avd-create.txt
+          AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -r | head -n1)
+          while IFS= read -r apk; do
+            echo "===== $(basename "$apk") =====" >> artifacts/aapt-badging.txt
+            "$AAPT" dump badging "$apk" >> artifacts/aapt-badging.txt 2>&1 || true
+            if [[ $(basename "$apk") == *base* ]]; then
+              echo "===== $(basename "$apk") =====" >> artifacts/manifest-xmltree.txt
+              "$AAPT" dump xmltree "$apk" AndroidManifest.xml >> artifacts/manifest-xmltree.txt 2>&1 || true
+            fi
+          done < artifacts/apk-files.txt
+
+          curl -fL --retry 5 --retry-all-errors 'https://dl.google.com/android/repository/emulator-darwin_aarch64-12038310.zip' -o "$RUNNER_TEMP/emulator.zip"
+          if [ -d "$ANDROID_HOME/emulator.runner" ]; then rm -rf "$ANDROID_HOME/emulator.runner"; fi
+          if [ -d "$ANDROID_HOME/emulator" ]; then mv "$ANDROID_HOME/emulator" "$ANDROID_HOME/emulator.runner"; fi
+          ditto -x -k "$RUNNER_TEMP/emulator.zip" "$ANDROID_HOME"
+          "$ANDROID_HOME/emulator/emulator" -version 2>&1 | tee artifacts/emulator-version.txt
+
+      - name: Boot app and probe referral
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          EMU="$ANDROID_HOME/emulator/emulator"
+          "$ADB" kill-server || true
+          nohup "$EMU" @evermore-arm -no-window -gpu swiftshader_indirect -no-snapshot -wipe-data -noaudio -no-boot-anim -accel off -memory 3072 -cores 2 -netdelay none -netspeed full >artifacts/emulator-stdout.txt 2>artifacts/emulator-stderr.txt &
+          EMUPID=$!
+          echo "pid=$EMUPID" | tee artifacts/emulator-pid.txt
+          READY=0
+          for i in $(seq 1 500); do
+            if "$ADB" get-state >/dev/null 2>&1; then READY=1; break; fi
+            if ! kill -0 "$EMUPID" 2>/dev/null; then break; fi
+            sleep 3
+          done
+          if [ "$READY" -ne 1 ]; then
+            { echo 'adb_ready=false'; ps -p "$EMUPID" -o pid,stat,command || true; } | tee artifacts/RESULT.txt
+            exit 3
+          fi
+          BOOTED=0
+          for i in $(seq 1 500); do
+            if [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ]; then BOOTED=1; break; fi
+            if ! kill -0 "$EMUPID" 2>/dev/null; then break; fi
+            sleep 3
+          done
+          if [ "$BOOTED" -ne 1 ]; then echo -e 'adb_ready=true\nbooted=false' | tee artifacts/RESULT.txt; exit 4; fi
+          "$ADB" devices -l | tee artifacts/adb-devices.txt
+          "$ADB" shell getprop ro.product.cpu.abilist | tee artifacts/guest-abilist.txt
+          "$ADB" shell uname -m | tee artifacts/guest-uname.txt
+          "$ADB" shell getprop ro.build.version.release | tee artifacts/android-version.txt
+          "$ADB" shell settings put global window_animation_scale 0
+          "$ADB" shell settings put global transition_animation_scale 0
+          "$ADB" shell settings put global animator_duration_scale 0
+          "$ADB" shell settings put global package_verifier_enable 0
+          "$ADB" shell settings put global verifier_verify_adb_installs 0
+
+          mapfile -t ALL_APKS < <(find "$RUNNER_TEMP/evermore-apks" -type f -name '*.apk' | sort)
+          INSTALL_APKS=()
+          for apk in "${ALL_APKS[@]}"; do
+            low=$(basename "$apk" | tr '[:upper:]' '[:lower:]')
+            if [[ "$low" == *x86* && "$low" != *arm* ]]; then continue; fi
+            if [[ "$low" == *armeabi_v7a* || "$low" == *armeabi-v7a* ]]; then continue; fi
+            INSTALL_APKS+=("$apk")
+          done
+          printf '%s\n' "${INSTALL_APKS[@]}" | tee artifacts/install-apks.txt
+          set +e
+          "$ADB" install-multiple -r -t -g "${INSTALL_APKS[@]}" 2>&1 | tee artifacts/install.txt
+          INSTALL_EXIT=${PIPESTATUS[0]}
+          set -e
+          "$ADB" shell pm path "$PKG" 2>&1 | tee artifacts/package-paths.txt || true
+          INSTALLED=false
+          if "$ADB" shell pm path "$PKG" 2>/dev/null | grep -q '^package:'; then INSTALLED=true; fi
+          "$ADB" shell dumpsys package "$PKG" > artifacts/package-dump.txt 2>&1 || true
+          "$ADB" shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_CUSTOM" > artifacts/custom-referral-handlers.txt 2>&1 || true
+          "$ADB" shell cmd package query-activities -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" > artifacts/https-referral-handlers.txt 2>&1 || true
+
+          snapshot() {
+            local name="$1"
+            "$ADB" exec-out screencap -p > "artifacts/$name.png" || true
+            "$ADB" shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            "$ADB" pull /sdcard/window.xml "artifacts/$name.xml" >/dev/null 2>&1 || true
+            "$ADB" shell dumpsys activity activities > "artifacts/$name-activities.txt" 2>&1 || true
+            "$ADB" shell dumpsys window windows > "artifacts/$name-windows.txt" 2>&1 || true
+          }
+          if [ "$INSTALLED" = true ]; then
+            "$ADB" logcat -c || true
+            "$ADB" shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 2>&1 | tee artifacts/first-launch.txt || true
+            sleep 25; snapshot 01-first-launch
+            sleep 20; snapshot 02-first-launch-45s
+            "$ADB" shell am force-stop "$PKG" || true
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_CUSTOM" -p "$PKG" 2>&1 | tee artifacts/custom-referral.txt || true
+            sleep 20; snapshot 03-custom-referral
+            "$ADB" shell am force-stop "$PKG" || true
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" -p "$PKG" 2>&1 | tee artifacts/https-referral-app.txt || true
+            sleep 20; snapshot 04-https-referral-app
+            "$ADB" shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$REFERRAL_HTTPS" 2>&1 | tee artifacts/https-referral-generic.txt || true
+            sleep 20; snapshot 05-https-referral-generic
+          fi
+          "$ADB" logcat -d -v threadtime > artifacts/logcat.txt 2>&1 || true
+          TOP=$("$ADB" shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'mResumedActivity|topResumedActivity' || true)
+          {
+            echo 'adb_ready=true'
+            echo 'booted=true'
+            echo "installed=$INSTALLED"
+            echo "install_exit=$INSTALL_EXIT"
+            echo "guest_abi=$("$ADB" shell getprop ro.product.cpu.abilist 2>/dev/null | tr -d '\r')"
+            echo "guest_uname=$("$ADB" shell uname -m 2>/dev/null | tr -d '\r')"
+            echo "top_activity=$TOP"
+          } | tee artifacts/RESULT.txt
+          [ "$INSTALLED" = true ]
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evermore-bunapk-macos-arm64-proof
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 3
